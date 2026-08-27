@@ -3,7 +3,6 @@ import { ERC8183JobOps, fundedJobWatcher } from "@bnbagent/sdk/erc8183";
 import { LocalStorageProvider } from "@bnbagent/sdk/storage";
 import { createPublicClient, http, parseAbiItem } from "viem";
 import { bscTestnet } from "viem/chains";
-import { CONTRACTS } from "../src/lib/chain.js";
 
 loadEnv();
 
@@ -18,6 +17,7 @@ const servicePrice = BigInt(process.env.ERC8183_SERVICE_PRICE || "10000000000000
 const agentUrl = process.env.ERC8183_AGENT_URL;
 if (!agentUrl) throw new Error("ERC8183_AGENT_URL is required for the provider worker");
 
+const AGENTIC_COMMERCE = "0xa206c0517b6371c6638cd9e4a42cc9f02a33b0de";
 const wallet = new EVMWalletProvider({ password: process.env.WALLET_PASSWORD, privateKey: process.env.PRIVATE_KEY });
 const client = await ERC8183Client.create({ walletProvider: wallet, network });
 const jobOps = await ERC8183JobOps.create({
@@ -26,7 +26,6 @@ const jobOps = await ERC8183JobOps.create({
   storageProvider: new LocalStorageProvider(process.env.STORAGE_LOCAL_PATH || ".agent-data"),
   servicePrice,
   agentUrl,
-  // Controlled AgentForge testnet demo: jobs are created directly by the marketplace.
   allowUnsignedJobs: true,
 });
 
@@ -42,7 +41,7 @@ async function setBudgetsForOpenJobs() {
   const fromBlock = lastScannedBlock === null ? (latest > 5000n ? latest - 5000n : 0n) : lastScannedBlock + 1n;
   if (fromBlock > latest) return;
 
-  const logs = await publicClient.getLogs({ address: CONTRACTS.agenticCommerce, event: jobCreatedEvent, fromBlock, toBlock: latest });
+  const logs = await publicClient.getLogs({ address: AGENTIC_COMMERCE, event: jobCreatedEvent, fromBlock, toBlock: latest });
   lastScannedBlock = latest;
 
   for (const log of logs) {
