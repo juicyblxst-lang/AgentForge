@@ -5,8 +5,8 @@ import { CONTRACTS } from './chain';
 const commerceAbi = [
   { type: 'function', name: 'createJob', stateMutability: 'nonpayable', inputs: [{ name:'provider',type:'address' },{ name:'evaluator',type:'address' },{ name:'expiredAt',type:'uint256' },{ name:'description',type:'string' },{ name:'hook',type:'address' }], outputs: [] },
   { type: 'function', name: 'fund', stateMutability: 'nonpayable', inputs: [{name:'jobId',type:'uint256'},{name:'expectedBudget',type:'uint256'},{name:'optParams',type:'bytes'}], outputs: [] },
-  { type: 'function', name: 'paymentToken', stateMutability: 'view', inputs: [], outputs: [{type:'address'}] },
-  { type: 'function', name: 'getJob', stateMutability: 'view', inputs: [{name:'jobId',type:'uint256'}], outputs: [{name:'job',type:'tuple',components:[{name:'id',type:'uint256'},{name:'client',type:'address'},{name:'provider',type:'address'},{name:'evaluator',type:'address'},{name:'description',type:'string'},{name:'budget',type:'uint256'},{name:'expiredAt',type:'uint256'},{name:'status',type:'uint8'},{name:'hook',type:'address'},{name:'submittedAt',type:'uint256'},{name:'deliverable',type:'bytes32'}]}] },
+  { type: 'function', name: 'paymentToken', stateMutability:'view', inputs:[], outputs:[{type:'address'}] },
+  { type: 'function', name: 'getJob', stateMutability:'view', inputs:[{name:'jobId',type:'uint256'}], outputs:[{name:'job',type:'tuple',components:[{name:'id',type:'uint256'},{name:'client',type:'address'},{name:'provider',type:'address'},{name:'evaluator',type:'address'},{name:'description',type:'string'},{name:'budget',type:'uint256'},{name:'expiredAt',type:'uint256'},{name:'status',type:'uint8'},{name:'hook',type:'address'},{name:'submittedAt',type:'uint256'},{name:'deliverable',type:'bytes32'}]}] },
 ] as const;
 const routerAbi = [
   { type:'function', name:'registerJob', stateMutability:'nonpayable', inputs:[{name:'jobId',type:'uint256'},{name:'policy',type:'address'}], outputs:[] },
@@ -31,9 +31,36 @@ export function mapJobStatus(status:number):JobChainStatus {
   return ({0:'OPEN',1:'FUNDED',2:'SUBMITTED',3:'COMPLETED',4:'REJECTED',5:'EXPIRED'} as Record<number,JobChainStatus>)[status] ?? 'UNKNOWN';
 }
 
+type Eip1193Provider = { request: (args: { method: string; params?: unknown[] }) => Promise<unknown> };
+type Eip6963Detail = { info: { name?: string; rdns?: string }; provider: Eip1193Provider };
+
+async function discoverEvmProvider(): Promise<Eip1193Provider | undefined> {
+  const win = window as Window & { ethereum?: Eip1193Provider | Eip1193Provider[] };
+  const injected = win.ethereum;
+  if (injected) {
+    const candidates = Array.isArray(injected) ? injected : [injected];
+    return candidates.find((candidate) => (candidate as any).isMetaMask) || candidates[0];
+  }
+  return new Promise((resolve) => {
+    const providers: Eip6963Detail[] = [];
+    const onAnnounce = (event: Event) => {
+      const detail = (event as CustomEvent<Eip6963Detail>).detail;
+      if (detail?.provider) providers.push(detail);
+    };
+    const finish = () => {
+      window.removeEventListener('eip6963:announceProvider', onAnnounce as EventListener);
+      const metamask = providers.find((item) => item.info?.rdns === 'io.metamask' || item.info?.name?.toLowerCase() === 'metamask');
+      resolve((metamask || providers[0])?.provider);
+    };
+    window.addEventListener('eip6963:announceProvider', onAnnounce as EventListener);
+    window.dispatchEvent(new Event('eip6963:requestProvider'));
+    window.setTimeout(finish, 300);
+  });
+}
+
 export async function connectWallet() {
-  const provider = (window as any).ethereum;
-  if (!provider) throw new Error('Install an EVM wallet such as MetaMask.');
+  const provider = await discoverEvmProvider();
+  if (!provider) throw new Error('MetaMask was not detected in this browser. Make sure the MetaMask extension is installed and enabled, then refresh AgentForge.');
   const wallet = createWalletClient({ chain:bscTestnet, transport:custom(provider) });
   const [account] = await wallet.requestAddresses();
   const chainId = await wallet.getChainId();
@@ -48,9 +75,7 @@ async function tx(wallet:any, request:any): Promise<Hash> {
   return hash;
 }
 
-async function readJob(jobId: bigint) {
-  return publicBscClient.readContract({ address:CONTRACTS.agenticCommerce, abi:commerceAbi, functionName:'getJob', args:[jobId] });
-}
+async function readJob(jobId: bigint) { return publicBscClient.readContract({ address:CONTRACTS.agenticCommerce, abi:commerceAbi, functionName:'getJob', args:[jobId] }); }
 
 async function waitForProviderBudget(jobId: bigint, expected: bigint, timeoutMs = 120_000) {
   const started = Date.now();
@@ -69,33 +94,24 @@ export async function createAndFundJob(account:Address, wallet:any, provider:Add
   const paymentToken = await publicBscClient.readContract({address:CONTRACTS.agenticCommerce,abi:commerceAbi,functionName:'paymentToken'});
   const now = BigInt(Math.floor(Date.now()/1000));
   const expiredAt = now + disputeWindow + 600n;
-
   const createHash = await tx(wallet, { account, address:CONTRACTS.agenticCommerce, abi:commerceAbi, functionName:'createJob', args:[provider,CONTRACTS.evaluatorRouter,expiredAt,description,CONTRACTS.evaluatorRouter] });
   const receipt = await publicBscClient.getTransactionReceipt({ hash:createHash });
   let jobId: bigint | undefined;
   for (const log of receipt.logs) {
     if (log.address.toLowerCase() !== CONTRACTS.agenticCommerce.toLowerCase()) continue;
-    try {
-      const decoded = decodeEventLog({ abi:[jobCreatedEvent], data:log.data, topics:log.topics });
-      if (decoded.eventName === 'JobCreated') { jobId = decoded.args.jobId; break; }
-    } catch { /* ignore unrelated logs */ }
+    try { const decoded = decodeEventLog({ abi:[jobCreatedEvent], data:log.data, topics:log.topics }); if (decoded.eventName === 'JobCreated') { jobId = decoded.args.jobId; break; } } catch { /* ignore unrelated logs */ }
   }
   if (jobId === undefined) throw new Error('Could not recover jobId from JobCreated event');
-
   const jobBeforeRegister = await readJob(jobId);
   if (jobBeforeRegister.provider.toLowerCase() !== provider.toLowerCase()) throw new Error('On-chain provider does not match selected ERC-8004 agent wallet');
-
   const registered = await publicBscClient.readContract({ address:CONTRACTS.evaluatorRouter, abi:routerAbi, functionName:'policyWhitelist', args:[CONTRACTS.optimisticPolicy] });
   if (!registered) throw new Error('OptimisticPolicy is not whitelisted by the EvaluatorRouter');
   await tx(wallet,{account,address:CONTRACTS.evaluatorRouter,abi:routerAbi,functionName:'registerJob',args:[jobId,CONTRACTS.optimisticPolicy]});
-
   await waitForProviderBudget(jobId, budget);
-
   const allowance = await publicBscClient.readContract({address:paymentToken,abi:erc20Abi,functionName:'allowance',args:[account,CONTRACTS.agenticCommerce]});
   if (allowance < budget) await tx(wallet,{account,address:paymentToken,abi:erc20Abi,functionName:'approve',args:[CONTRACTS.agenticCommerce,budget]});
   const balance = await publicBscClient.readContract({address:paymentToken,abi:erc20Abi,functionName:'balanceOf',args:[account]});
   if (balance < budget) throw new Error(`Insufficient payment-token balance. Need ${budget.toString()} base units.`);
-
   const fundHash = await tx(wallet,{account,address:CONTRACTS.agenticCommerce,abi:commerceAbi,functionName:'fund',args:[jobId,budget,'0x']});
   const fundedJob = await readJob(jobId);
   if (fundedJob.status !== 1) throw new Error(`Job ${jobId.toString()} was not confirmed as FUNDED on-chain (status ${fundedJob.status})`);
@@ -103,22 +119,10 @@ export async function createAndFundJob(account:Address, wallet:any, provider:Add
 }
 
 export async function getJob(jobId: bigint) { return readJob(jobId); }
-
 export async function waitForJobStatus(jobId:bigint, target:Exclude<JobChainStatus,'OPEN'|'UNKNOWN'>, timeoutMs=300_000, onUpdate?:(status:JobChainStatus)=>void) {
   const started=Date.now();
-  while(Date.now()-started<timeoutMs){
-    const job=await readJob(jobId);
-    const status=mapJobStatus(Number(job.status));
-    onUpdate?.(status);
-    if(status===target) return job;
-    if(['REJECTED','EXPIRED','UNKNOWN'].includes(status)) throw new Error(`Job ${jobId.toString()} reached terminal status ${status}`);
-    await new Promise(resolve=>setTimeout(resolve,5000));
-  }
+  while(Date.now()-started<timeoutMs){ const job=await readJob(jobId); const status=mapJobStatus(Number(job.status)); onUpdate?.(status); if(status===target) return job; if(['REJECTED','EXPIRED','UNKNOWN'].includes(status)) throw new Error(`Job ${jobId.toString()} reached terminal status ${status}`); await new Promise(resolve=>setTimeout(resolve,5000)); }
   throw new Error(`Timed out waiting for job ${jobId.toString()} to reach ${target}.`);
 }
-
-export async function settleJob(account:Address, wallet:any, jobId:bigint) {
-  const hash = await tx(wallet,{account,address:CONTRACTS.evaluatorRouter,abi:routerAbi,functionName:'settle',args:[jobId,'0x']});
-  return hash;
-}
+export async function settleJob(account:Address, wallet:any, jobId:bigint) { return tx(wallet,{account,address:CONTRACTS.evaluatorRouter,abi:routerAbi,functionName:'settle',args:[jobId,'0x']}); }
 export function deliverableHash(text:string): `0x${string}` { return keccak256(stringToHex(text)); }
