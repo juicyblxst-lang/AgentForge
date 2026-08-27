@@ -1,47 +1,67 @@
 import React from 'react';
 import { createRoot } from 'react-dom/client';
 import './styles.css';
+import { discoverBscAgents, type MarketplaceAgent } from './lib/discovery';
+import { getAgentIdentity } from './lib/erc8004';
+import { connectWallet, createAndFundJob } from './lib/erc8183';
+import { AgentCard } from './components/AgentCard';
 
 const categories = ['All agents', 'Research', 'Trading', 'DeFi', 'Commerce'];
 
 function App() {
   const [category, setCategory] = React.useState('All agents');
-  const [connected, setConnected] = React.useState(false);
+  const [agents, setAgents] = React.useState<MarketplaceAgent[]>([]);
+  const [selected, setSelected] = React.useState<MarketplaceAgent | null>(null);
+  const [wallet, setWallet] = React.useState<{ wallet:any; account:`0x${string}` } | null>(null);
+  const [identity, setIdentity] = React.useState<any>(null);
+  const [status, setStatus] = React.useState('Loading Agent0…');
+  const [busy, setBusy] = React.useState(false);
+  const [result, setResult] = React.useState<any>(null);
 
-  return (
-    <main className="shell">
-      <header className="nav">
-        <div className="brand">AGENTFORGE</div>
-        <div className="network"><span /> BSC Testnet</div>
-        <button className="wallet" onClick={() => setConnected(true)}>
-          {connected ? '0x••••••' : 'Connect wallet'}
-        </button>
-      </header>
+  const load = React.useCallback(async () => {
+    try { setStatus('Discovering real BSC Testnet agents…'); setAgents(await discoverBscAgents()); setStatus('Live Agent0 discovery'); }
+    catch (e) { setStatus(e instanceof Error ? e.message : 'Discovery failed'); }
+  }, []);
+  React.useEffect(() => { void load(); }, [load]);
 
-      <section className="hero">
-        <p className="eyebrow">ERC-8004 AGENT MARKETPLACE</p>
-        <h1>Find an agent.<br />Verify it. Execute.</h1>
-        <p className="lede">Discover real agents on BNB Chain, verify their on-chain identity and capabilities, then authorize execution from your wallet.</p>
-      </section>
+  async function openAgent(agent: MarketplaceAgent) {
+    setSelected(agent); setResult(null); setIdentity(null);
+    try { setIdentity(await getAgentIdentity(BigInt(agent.agentId))); } catch (e) { setStatus(e instanceof Error ? e.message : 'Identity verification failed'); }
+  }
 
-      <section className="market">
-        <div className="categories">
-          {categories.map((item) => (
-            <button key={item} className={category === item ? 'active' : ''} onClick={() => setCategory(item)}>{item}</button>
-          ))}
-        </div>
+  async function connect() {
+    try { setWallet(await connectWallet()); } catch (e) { setStatus(e instanceof Error ? e.message : 'Wallet connection failed'); }
+  }
 
-        <div className="empty-state">
-          <div className="orb">A</div>
-          <p className="eyebrow">LIVE DISCOVERY</p>
-          <h2>{category === 'All agents' ? 'Connect discovery to see real agents' : `Explore ${category}`}</h2>
-          <p>The marketplace shell is ready. The next integration wires Agent0 discovery and ERC-8004 verification into these cards.</p>
-        </div>
-      </section>
-    </main>
-  );
+  async function execute() {
+    if (!selected) return;
+    if (!wallet) { await connect(); return; }
+    if (!identity) return setStatus('Verify the agent identity first.');
+    if (!selected.agentWallet) return setStatus('Agent has no ERC-8004 agent wallet; execution blocked.');
+    setBusy(true); setStatus('Creating and funding ERC-8183 job…');
+    try {
+      const value = await createAndFundJob(wallet.account, wallet.wallet, selected.agentWallet as `0x${string}`, 10_000_000_000_000_000n, 'AgentForge test execution');
+      setResult(value); setStatus(`Job ${value.jobId} funded on BSC Testnet`);
+    } catch (e) { setStatus(e instanceof Error ? e.message : 'Execution failed'); }
+    finally { setBusy(false); }
+  }
+
+  const visible = agents.filter(a => category === 'All agents' || a.capabilities.some(c => c.toLowerCase().includes(category.toLowerCase())) || (a.description ?? '').toLowerCase().includes(category.toLowerCase()));
+
+  return <main className="shell">
+    <header className="nav"><div className="brand">AGENTFORGE</div><div className="network"><span /> BSC Testnet · 97</div><button className="wallet" onClick={connect}>{wallet ? `${wallet.account.slice(0,6)}…${wallet.account.slice(-4)}` : 'Connect wallet'}</button></header>
+    <section className="hero"><p className="eyebrow">ERC-8004 AGENT MARKETPLACE</p><h1>Find an agent.<br />Verify it. Execute.</h1><p className="lede">Real Agent0 discovery, on-chain ERC-8004 identity verification and ERC-8183 commerce on BSC Testnet.</p></section>
+    <section className="market">
+      <div className="toolbar"><div className="categories">{categories.map(item => <button key={item} className={category === item ? 'active' : ''} onClick={() => setCategory(item)}>{item}</button>)}</div><button className="refresh" onClick={() => void load()}>Refresh</button></div>
+      <p className="status">{status}</p>
+      {selected ? <section className="detail">
+        <button className="back" onClick={() => setSelected(null)}>← Marketplace</button>
+        <div className="detail-head"><div><p className="eyebrow">AGENT DETAIL</p><h2>{selected.name}</h2><p>{selected.description || 'ERC-8004 registered agent on BSC Testnet.'}</p></div><span className="verified">{identity ? '✓ Identity verified' : 'Verifying…'}</span></div>
+        <div className="facts"><div><small>AGENT ID</small><strong>{selected.agentId}</strong></div><div><small>OWNER</small><strong>{identity?.owner || selected.owner || '—'}</strong></div><div><small>AGENT WALLET</small><strong>{identity?.agentWallet || selected.agentWallet || '—'}</strong></div><div><small>CAPABILITIES</small><strong>{selected.capabilities.join(', ') || 'None declared'}</strong></div></div>
+        <div className="permission-panel"><p className="eyebrow">AUTHORIZATION</p><h2>Review execution</h2><p>AgentForge will create an ERC-8183 job for this agent and fund it with 0.01 U from your connected BSC Testnet wallet. You will approve the wallet transactions.</p><div className="facts"><div><small>NETWORK</small><strong>BSC Testnet (97)</strong></div><div><small>PROTOCOL</small><strong>ERC-8183</strong></div><div><small>MAX PAYMENT</small><strong>0.01 U</strong></div></div><button className="authorize" disabled={busy || !identity} onClick={() => void execute()}>{busy ? 'Executing…' : wallet ? 'Authorize & execute' : 'Connect wallet to execute'}</button></div>
+        {result && <div className="result"><p className="eyebrow">ON-CHAIN RESULT</p><strong>Job #{String(result.jobId)}</strong><p>Create: {result.createHash}</p><p>Fund: {result.fundHash}</p></div>}
+      </section> : <div className="agents">{visible.length ? visible.map(agent => <AgentCard key={agent.id} agent={agent} onOpen={() => void openAgent(agent)} />) : <div className="empty-state"><div className="orb">A</div><p className="eyebrow">{status}</p><h2>No agents loaded</h2><p>Set the Agent0 Graph API key in your local environment, then refresh.</p></div>}</div>}
+    </section>
+  </main>;
 }
-
-createRoot(document.getElementById('root')!).render(
-  <React.StrictMode><App /></React.StrictMode>,
-);
+createRoot(document.getElementById('root')!).render(<React.StrictMode><App /></React.StrictMode>);
