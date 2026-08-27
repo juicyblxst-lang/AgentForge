@@ -47,6 +47,17 @@ async function readJob(jobId: bigint) {
   return publicBscClient.readContract({ address:CONTRACTS.agenticCommerce, abi:commerceAbi, functionName:'getJob', args:[jobId] });
 }
 
+async function waitForProviderBudget(jobId: bigint, expected: bigint, timeoutMs = 120_000) {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    const job = await readJob(jobId);
+    if (job.status !== 0) throw new Error(`Job ${jobId.toString()} left OPEN state before provider budget was set (status ${job.status})`);
+    if (job.budget >= expected) return job.budget;
+    await new Promise(resolve => setTimeout(resolve, 3000));
+  }
+  throw new Error(`Provider did not set the ERC-8183 budget within ${Math.floor(timeoutMs / 1000)} seconds. The provider worker must be running and assigned to this agent.`);
+}
+
 export async function createAndFundJob(account:Address, wallet:any, provider:Address, budget:bigint, description:string) {
   if (budget <= 0n) throw new Error('Budget must be greater than zero.');
   const disputeWindow = await publicBscClient.readContract({address:CONTRACTS.optimisticPolicy,abi:policyAbi,functionName:'disputeWindow'});
@@ -72,6 +83,10 @@ export async function createAndFundJob(account:Address, wallet:any, provider:Add
   const registered = await publicBscClient.readContract({ address:CONTRACTS.evaluatorRouter, abi:routerAbi, functionName:'policyWhitelist', args:[CONTRACTS.optimisticPolicy] });
   if (!registered) throw new Error('OptimisticPolicy is not whitelisted by the EvaluatorRouter');
   await tx(wallet,{account,address:CONTRACTS.evaluatorRouter,abi:routerAbi,functionName:'registerJob',args:[jobId,CONTRACTS.optimisticPolicy]});
+
+  // ERC-8183 requires the provider to set the budget while the job is OPEN.
+  // Wait for the configured AgentForge provider worker to do that before fund().
+  await waitForProviderBudget(jobId, budget);
 
   const allowance = await publicBscClient.readContract({address:paymentToken,abi:erc20Abi,functionName:'allowance',args:[account,CONTRACTS.agenticCommerce]});
   if (allowance < budget) await tx(wallet,{account,address:paymentToken,abi:erc20Abi,functionName:'approve',args:[CONTRACTS.agenticCommerce,budget]});
