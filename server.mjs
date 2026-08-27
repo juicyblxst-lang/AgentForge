@@ -9,6 +9,7 @@ const port = Number(process.env.PORT || 3000);
 const subgraphId = process.env.AGENT0_SUBGRAPH_ID || 'BTjind17gmRZ6YhT9peaCM13SvWuqztsmqyfjpntbg3Z';
 const apiKey = process.env.AGENT0_GRAPH_API_KEY;
 const endpoint = process.env.AGENT0_GRAPH_URL || `https://gateway.thegraph.com/api/subgraphs/id/${subgraphId}`;
+const providerAddress = process.env.AGENTFORGE_PROVIDER_ADDRESS || '';
 const query = `query Agents($first: Int!, $skip: Int!) {
   agents(first: $first, skip: $skip, orderBy: lastActivity, orderDirection: desc) {
     id agentId chainId owner agentWallet agentURI
@@ -42,11 +43,16 @@ async function agents(req, res) {
   }
 }
 
+function provider(req, res) {
+  return json(res, 200, { configured: Boolean(providerAddress), address: providerAddress || null, chainId: 97 });
+}
+
 const mime = { '.html':'text/html; charset=utf-8', '.js':'text/javascript; charset=utf-8', '.css':'text/css; charset=utf-8', '.json':'application/json; charset=utf-8', '.svg':'image/svg+xml', '.png':'image/png', '.ico':'image/x-icon' };
 
 createServer(async (req, res) => {
   try {
     if (req.url?.startsWith('/api/agents')) return agents(req, res);
+    if (req.url?.startsWith('/api/provider')) return provider(req, res);
     if (req.method !== 'GET' && req.method !== 'HEAD') return json(res, 405, { error: 'Method not allowed' });
     const pathname = new URL(req.url || '/', `http://${req.headers.host}`).pathname;
     const safe = normalize(pathname).replace(/^([.][.][/\\])+/, '');
