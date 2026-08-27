@@ -3,8 +3,8 @@ import { createRoot } from 'react-dom/client';
 import './styles.css';
 import { discoverBscAgents, type MarketplaceAgent } from './lib/discovery';
 import { getAgentIdentity } from './lib/erc8004';
-import { connectWallet, createAndFundJob, getJob } from './lib/erc8183';
-import { listStoredExecutions, saveStoredExecution, type StoredExecution } from './lib/executionStore';
+import { connectWallet, createAndFundJob, getJob, waitForJobStatus } from './lib/erc8183';
+import { listStoredExecutions, saveStoredExecution, syncExecution, type StoredExecution } from './lib/executionStore';
 import { loadRemoteExecutions, persistRemoteExecution } from './lib/remoteExecutionStore';
 import { verifyTransactionOnChain } from './lib/verification';
 import { CONTRACTS } from './lib/chain';
@@ -21,17 +21,52 @@ function App() {
   const [providerAddress,setProviderAddress]=React.useState<string|null>(null);
 
   const hydrateHistory=React.useCallback(async(account:string)=>{
-    try {
-      const remote=await loadRemoteExecutions(account);
-      if(remote.length) { remote.forEach(saveStoredExecution); setHistory(listStoredExecutions()); }
-    } catch { /* local recovery remains available when Supabase is not configured */ }
+    try { const remote=await loadRemoteExecutions(account); remote.forEach(saveStoredExecution); setHistory(listStoredExecutions()); }
+    catch { setHistory(listStoredExecutions()); }
   },[]);
 
   const load=React.useCallback(async()=>{try{setStatus('Discovering real BSC Testnet agents…');const [discovered,provider]=await Promise.all([discoverBscAgents(),fetch('/api/provider').then(r=>r.json())]);setAgents(discovered);setProviderAddress(provider.address||null);setStatus(provider.address?'Live Agent0 discovery · provider ready':'Live Agent0 discovery · provider not configured')}catch(e){setStatus(e instanceof Error?e.message:'Discovery failed')}},[]);
   React.useEffect(()=>{void load();setHistory(listStoredExecutions())},[load]);
   async function openAgent(agent:MarketplaceAgent){setSelected(agent);setResult(null);setIdentity(null);try{setStatus('Reading ERC-8004 identity from BSC…');setIdentity(await getAgentIdentity(BigInt(agent.agentId)));setStatus('ERC-8004 identity verified')}catch(e){setStatus(e instanceof Error?e.message:'Identity verification failed')}}
   async function connect(){try{const connected=await connectWallet();setWallet(connected);setStatus('Wallet connected on BSC Testnet');await hydrateHistory(connected.account)}catch(e){setStatus(e instanceof Error?e.message:'Wallet connection failed')}}
-  async function execute(){if(!selected)return;if(!providerAddress)return setStatus('Provider execution is not configured yet. Register/deploy the AgentForge provider first.');if(!selected.agentWallet||selected.agentWallet.toLowerCase()!==providerAddress.toLowerCase())return setStatus('This agent is discoverable, but it is not the AgentForge executable provider. Execution is blocked.');if(!wallet){await connect();return}if(!identity)return setStatus('Verify the agent identity first.');setBusy(true);setStatus('Creating ERC-8183 job…');try{const value=await createAndFundJob(wallet.account,wallet.wallet,selected.agentWallet as `0x${string}`,DEMO_BUDGET,'AgentForge test execution');setStatus('Verifying create + fund transactions independently…');const [createVerification,fundVerification]=await Promise.all([verifyTransactionOnChain(value.createHash,CONTRACTS.agenticCommerce),verifyTransactionOnChain(value.fundHash,CONTRACTS.agenticCommerce)]);const job=await getJob(value.jobId);const verified=createVerification.verified&&fundVerification.verified&&job.client.toLowerCase()===wallet.account.toLowerCase()&&job.provider.toLowerCase()===selected.agentWallet.toLowerCase()&&job.status===1;const stored:StoredExecution={id:`${value.jobId}-${value.fundHash}`,agentId:selected.agentId,agentName:selected.name,wallet:wallet.account,chainId:97,protocol:'ERC-8183',jobId:String(value.jobId),createHash:value.createHash,fundHash:value.fundHash,status:verified?'VERIFIED':'FAILED',createdAt:new Date().toISOString()};saveStoredExecution(stored);setHistory(listStoredExecutions());try{await persistRemoteExecution(stored);setStatus(verified?`Job ${value.jobId} is VERIFIED on BSC Testnet · persisted`:'On-chain verification failed · persisted')}catch{setStatus(verified?`Job ${value.jobId} is VERIFIED on BSC Testnet · local recovery only`:'On-chain verification failed · local recovery only')}setResult({...value,verified,createVerification,fundVerification});}catch(e){setStatus(e instanceof Error?e.message:'Execution failed')}finally{setBusy(false)}}
+
+  async function execute(){
+    if(!selected)return;
+    if(!providerAddress)return setStatus('Provider execution is not configured yet. Register/deploy the AgentForge provider first.');
+    if(!selected.agentWallet||selected.agentWallet.toLowerCase()!==providerAddress.toLowerCase())return setStatus('This agent is discoverable, but it is not the AgentForge executable provider. Execution is blocked.');
+    if(!wallet){await connect();return}
+    if(!identity)return setStatus('Verify the agent identity first.');
+    setBusy(true);
+    let stored:StoredExecution|undefined;
+    try{
+      setStatus('Creating ERC-8183 job…');
+      const value=await createAndFundJob(wallet.account,wallet.wallet,selected.agentWallet as `0x${string}`,DEMO_BUDGET,'AgentForge test execution');
+      stored={id:`${value.jobId}-${value.fundHash}`,agentId:selected.agentId,agentName:selected.name,wallet:wallet.account,chainId:97,protocol:'ERC-8183',jobId:String(value.jobId),createHash:value.createHash,fundHash:value.fundHash,status:'FUNDED',createdAt:new Date().toISOString(),updatedAt:new Date().toISOString()};
+      saveStoredExecution(stored);setHistory(listStoredExecutions());
+      try{await persistRemoteExecution(stored)}catch{/* local fallback */}
+
+      setStatus(`Job #${value.jobId} funded. Waiting for provider submission…`);
+      const submittedJob=await waitForJobStatus(value.jobId,'SUBMITTED',300_000,(chainStatus)=>{
+        if(chainStatus==='FUNDED')setStatus(`Job #${value.jobId} funded. Provider is working…`);
+      });
+      const submittedAt=new Date().toISOString();
+      stored={...stored,status:'SUBMITTED',updatedAt:submittedAt,submittedAt,deliverable:String(submittedJob.deliverable)};
+      await syncExecution(stored);setHistory(listStoredExecutions());
+
+      setStatus(`Provider submitted job #${value.jobId}. Verifying on-chain state…`);
+      const [createVerification,fundVerification]=await Promise.all([verifyTransactionOnChain(value.createHash,CONTRACTS.agenticCommerce),verifyTransactionOnChain(value.fundHash,CONTRACTS.agenticCommerce)]);
+      const job=await getJob(value.jobId);
+      const verified=createVerification.verified&&fundVerification.verified&&job.client.toLowerCase()===wallet.account.toLowerCase()&&job.provider.toLowerCase()===selected.agentWallet.toLowerCase()&&job.status===2;
+      stored={...stored,status:verified?'VERIFIED':'FAILED',updatedAt:new Date().toISOString()};
+      await syncExecution(stored);setHistory(listStoredExecutions());
+      setStatus(verified?`Job ${value.jobId} is VERIFIED on BSC Testnet · persisted`:'On-chain verification failed · persisted');
+      setResult({...value,verified,createVerification,fundVerification,job});
+    }catch(e){
+      if(stored){const failed={...stored,status:'FAILED' as const,updatedAt:new Date().toISOString()};saveStoredExecution(failed);setHistory(listStoredExecutions());try{await persistRemoteExecution(failed)}catch{/* local fallback */}}
+      setStatus(e instanceof Error?e.message:'Execution failed');
+    }finally{setBusy(false)}
+  }
+
   const visible=agents.filter(a=>category==='All agents'||a.capabilities.some(c=>c.toLowerCase().includes(category.toLowerCase()))||(a.description??'').toLowerCase().includes(category.toLowerCase()));
   return <main className="shell"><header className="nav"><div className="brand">AGENTFORGE</div><div className="network"><span/> BSC Testnet · 97</div><button className="wallet" onClick={connect}>{wallet?`${wallet.account.slice(0,6)}…${wallet.account.slice(-4)}`:'Connect wallet'}</button></header>
     <section className="hero"><p className="eyebrow">ERC-8004 AGENT MARKETPLACE</p><h1>Find an agent.<br/>Verify it. Execute.</h1><p className="lede">Real Agent0 discovery, on-chain ERC-8004 identity verification and ERC-8183 commerce on BSC Testnet.</p></section>
@@ -39,7 +74,7 @@ function App() {
       {selected?<section className="detail"><button className="back" onClick={()=>setSelected(null)}>← Marketplace</button><div className="detail-head"><div><p className="eyebrow">AGENT DETAIL</p><h2>{selected.name}</h2><p>{selected.description||'ERC-8004 registered agent on BSC Testnet.'}</p></div><span className="verified">{identity?'✓ Identity verified':'Verifying…'}</span></div>
         <div className="facts"><div><small>AGENT ID</small><strong>{selected.agentId}</strong></div><div><small>OWNER</small><strong>{identity?.owner||selected.owner||'—'}</strong></div><div><small>AGENT WALLET</small><strong>{identity?.agentWallet||selected.agentWallet||'—'}</strong></div><div><small>CAPABILITIES</small><strong>{selected.capabilities.join(', ')||'None declared'}</strong></div></div>
         <div className="permission-panel"><p className="eyebrow">AUTHORIZATION</p><h2>Review execution</h2><p>AgentForge will create an ERC-8183 job for this agent and fund it with 0.01 U from your connected BSC Testnet wallet. You will approve the wallet transactions.</p><div className="facts"><div><small>NETWORK</small><strong>BSC Testnet (97)</strong></div><div><small>PROTOCOL</small><strong>ERC-8183</strong></div><div><small>MAX PAYMENT</small><strong>0.01 U</strong></div></div><button className="authorize" disabled={busy||!identity||!providerAddress||!selected.agentWallet||selected.agentWallet.toLowerCase()!==providerAddress.toLowerCase()} onClick={()=>void execute()}>{busy?'Executing…':!providerAddress?'Provider not configured':selected.agentWallet?.toLowerCase()!==providerAddress?.toLowerCase()?'Not executable provider':wallet?'Authorize & execute':'Connect wallet to execute'}</button></div>
-        {result&&<div className="result"><p className="eyebrow">ON-CHAIN RESULT</p><strong>Job #{String(result.jobId)} · {result.verified?'VERIFIED':'FAILED VERIFICATION'}</strong><p>Create: {result.createHash}</p><p>Fund: {result.fundHash}</p></div>}
+        {result&&<div className="result"><p className="eyebrow">ON-CHAIN RESULT</p><strong>Job #{String(result.jobId)} · {result.verified?'VERIFIED':'FAILED VERIFICATION'}</strong><p>Create: {result.createHash}</p><p>Fund: {result.fundHash}</p><p>Provider submission status: {result.job?.status===2?'SUBMITTED':'—'}</p></div>}
       </section>:<><div className="agents">{visible.length?visible.map(agent=><AgentCard key={agent.id} agent={agent} onOpen={()=>void openAgent(agent)}/>):<div className="empty-state"><div className="orb">A</div><p className="eyebrow">{status}</p><h2>No agents loaded</h2><p>Set the Agent0 Graph API key in the environment, then refresh.</p></div>}</div>{history.length>0&&<div className="history"><p className="eyebrow">EXECUTION HISTORY · SURVIVES REFRESH</p>{history.slice(0,5).map(x=><div className="history-row" key={x.id}><strong>#{x.jobId} · {x.agentName}</strong><span>{x.status}</span><code>{x.fundHash.slice(0,12)}…</code></div>)}</div>}</>}
     </section></main>
 }
