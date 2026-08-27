@@ -1,3 +1,4 @@
+import { createServer } from "node:http";
 import { EVMWalletProvider, ERC8183Client, loadEnv } from "@bnbagent/sdk";
 import { ERC8183JobOps, fundedJobWatcher } from "@bnbagent/sdk/erc8183";
 import { LocalStorageProvider } from "@bnbagent/sdk/storage";
@@ -17,6 +18,7 @@ const servicePrice = BigInt(process.env.ERC8183_SERVICE_PRICE || "10000000000000
 const agentUrl = process.env.ERC8183_AGENT_URL;
 if (!agentUrl) throw new Error("ERC8183_AGENT_URL is required for the provider worker");
 
+const port = Number(process.env.PORT || 3000);
 const AGENTIC_COMMERCE = "0xa206c0517b6371c6638cd9e4a42cc9f02a33b0de";
 const wallet = new EVMWalletProvider({ password: process.env.WALLET_PASSWORD, privateKey: process.env.PRIVATE_KEY });
 const client = await ERC8183Client.create({ walletProvider: wallet, network });
@@ -35,6 +37,23 @@ const jobCreatedEvent = parseAbiItem(
 );
 const budgeted = new Set();
 let lastScannedBlock = null;
+
+const httpServer = createServer((req, res) => {
+  if (req.method === "GET" && req.url === "/status") {
+    res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+    res.end(JSON.stringify({ status: "ok", service: "agentforge-provider", network, chainId: 97, agentWallet: jobOps.agentAddress, servicePrice: servicePrice.toString(), agentUrl }));
+    return;
+  }
+  if (req.method === "GET" && req.url === "/health") {
+    res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+    res.end(JSON.stringify({ status: "ok", service: "agentforge-provider" }));
+    return;
+  }
+  res.writeHead(404, { "content-type": "application/json; charset=utf-8" });
+  res.end(JSON.stringify({ error: "Not found" }));
+});
+
+httpServer.listen(port, () => console.log(`[provider] HTTP status server listening on :${port}`));
 
 async function setBudgetsForOpenJobs() {
   const latest = await publicClient.getBlockNumber();
