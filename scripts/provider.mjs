@@ -20,6 +20,7 @@ if (!agentUrl) throw new Error("ERC8183_AGENT_URL is required for the provider w
 
 const port = Number(process.env.PORT || 3000);
 const AGENTIC_COMMERCE = "0xa206c0517b6371c6638cd9e4a42cc9f02a33b0de";
+const LOG_CHUNK_SIZE = BigInt(process.env.ERC8183_LOG_CHUNK_SIZE || "500");
 const wallet = new EVMWalletProvider({ password: process.env.WALLET_PASSWORD, privateKey: process.env.PRIVATE_KEY });
 const client = await ERC8183Client.create({ walletProvider: wallet, network });
 const jobOps = await ERC8183JobOps.create({
@@ -55,12 +56,23 @@ const httpServer = createServer((req, res) => {
 
 httpServer.listen(port, () => console.log(`[provider] HTTP status server listening on :${port}`));
 
+async function getJobCreatedLogs(fromBlock, toBlock) {
+  const logs = [];
+  for (let start = fromBlock; start <= toBlock; start += LOG_CHUNK_SIZE) {
+    const end = start + LOG_CHUNK_SIZE - 1n > toBlock ? toBlock : start + LOG_CHUNK_SIZE - 1n;
+    const chunk = await publicClient.getLogs({ address: AGENTIC_COMMERCE, event: jobCreatedEvent, fromBlock: start, toBlock: end });
+    logs.push(...chunk);
+  }
+  return logs;
+}
+
 async function setBudgetsForOpenJobs() {
   const latest = await publicClient.getBlockNumber();
-  const fromBlock = lastScannedBlock === null ? (latest > 5000n ? latest - 5000n : 0n) : lastScannedBlock + 1n;
+  const initialWindow = BigInt(process.env.ERC8183_INITIAL_SCAN_BLOCKS || "5000");
+  const fromBlock = lastScannedBlock === null ? (latest > initialWindow ? latest - initialWindow : 0n) : lastScannedBlock + 1n;
   if (fromBlock > latest) return;
 
-  const logs = await publicClient.getLogs({ address: AGENTIC_COMMERCE, event: jobCreatedEvent, fromBlock, toBlock: latest });
+  const logs = await getJobCreatedLogs(fromBlock, latest);
   lastScannedBlock = latest;
 
   for (const log of logs) {
@@ -86,6 +98,7 @@ async function setBudgetsForOpenJobs() {
 console.log(`[provider] address=${jobOps.agentAddress}`);
 console.log(`[provider] network=${network}`);
 console.log(`[provider] servicePrice=${servicePrice}`);
+console.log(`[provider] logChunkSize=${LOG_CHUNK_SIZE}`);
 console.log("[provider] waiting for OPEN jobs to set budget, then FUNDED jobs to execute");
 
 setInterval(() => void setBudgetsForOpenJobs().catch((error) => console.error("[provider] budget watcher error:", error instanceof Error ? error.message : error)), Number(process.env.ERC8183_FUNDED_POLL_INTERVAL || 30) * 1000);
