@@ -26,6 +26,11 @@ const jobCreatedEvent = { type:'event', name:'JobCreated', inputs:[
 
 export const publicBscClient = createPublicClient({ chain:bscTestnet, transport:http(import.meta.env.VITE_BSC_TESTNET_RPC_URL || undefined) });
 
+export type JobChainStatus = 'OPEN'|'FUNDED'|'SUBMITTED'|'COMPLETED'|'REJECTED'|'EXPIRED'|'UNKNOWN';
+export function mapJobStatus(status:number):JobChainStatus {
+  return ({0:'OPEN',1:'FUNDED',2:'SUBMITTED',3:'COMPLETED',4:'REJECTED',5:'EXPIRED'} as Record<number,JobChainStatus>)[status] ?? 'UNKNOWN';
+}
+
 export async function connectWallet() {
   const provider = (window as any).ethereum;
   if (!provider) throw new Error('Install an EVM wallet such as MetaMask.');
@@ -84,8 +89,6 @@ export async function createAndFundJob(account:Address, wallet:any, provider:Add
   if (!registered) throw new Error('OptimisticPolicy is not whitelisted by the EvaluatorRouter');
   await tx(wallet,{account,address:CONTRACTS.evaluatorRouter,abi:routerAbi,functionName:'registerJob',args:[jobId,CONTRACTS.optimisticPolicy]});
 
-  // ERC-8183 requires the provider to set the budget while the job is OPEN.
-  // Wait for the configured AgentForge provider worker to do that before fund().
   await waitForProviderBudget(jobId, budget);
 
   const allowance = await publicBscClient.readContract({address:paymentToken,abi:erc20Abi,functionName:'allowance',args:[account,CONTRACTS.agenticCommerce]});
@@ -100,6 +103,20 @@ export async function createAndFundJob(account:Address, wallet:any, provider:Add
 }
 
 export async function getJob(jobId: bigint) { return readJob(jobId); }
+
+export async function waitForJobStatus(jobId:bigint, target:Exclude<JobChainStatus,'OPEN'|'UNKNOWN'>, timeoutMs=300_000, onUpdate?:(status:JobChainStatus)=>void) {
+  const started=Date.now();
+  while(Date.now()-started<timeoutMs){
+    const job=await readJob(jobId);
+    const status=mapJobStatus(Number(job.status));
+    onUpdate?.(status);
+    if(status===target) return job;
+    if(['REJECTED','EXPIRED','UNKNOWN'].includes(status)) throw new Error(`Job ${jobId.toString()} reached terminal status ${status}`);
+    await new Promise(resolve=>setTimeout(resolve,5000));
+  }
+  throw new Error(`Timed out waiting for job ${jobId.toString()} to reach ${target}.`);
+}
+
 export async function settleJob(account:Address, wallet:any, jobId:bigint) {
   const hash = await tx(wallet,{account,address:CONTRACTS.evaluatorRouter,abi:routerAbi,functionName:'settle',args:[jobId,'0x']});
   return hash;
