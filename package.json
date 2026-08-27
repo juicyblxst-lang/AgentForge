@@ -8,6 +8,7 @@
     "build": "tsc -b && vite build",
     "start": "node server.mjs",
     "provider": "node scripts/provider.mjs",
+    "register:provider": "node scripts/register-provider.mjs",
     "preview": "vite preview",
     "test": "vitest run",
     "test:watch": "vitest",
@@ -24,6 +25,7 @@
   "devDependencies": {
     "@types/react": "^19.1.10",
     "@types/react-dom": "^19.1.7",
+    "@vitejs/plugin-react": "^5.0.2",
     "@vitejs/plugin-react": "^5.0.2",
     "typescript": "^5.9.2",
     "vite": "^7.1.3",
