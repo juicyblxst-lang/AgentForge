@@ -1,4 +1,4 @@
-import { createPublicClient, createWalletClient, custom, http, keccak256, stringToHex, type Address, type Hash } from 'viem';
+import { createPublicClient, createWalletClient, custom, http, decodeEventLog, keccak256, stringToHex, type Address, type Hash } from 'viem';
 import { bscTestnet } from 'viem/chains';
 import { CONTRACTS } from './chain';
 
@@ -17,9 +17,13 @@ const policyAbi = [{ type:'function', name:'disputeWindow', stateMutability:'vie
 const erc20Abi = [
   { type:'function', name:'approve', stateMutability:'nonpayable', inputs:[{name:'spender',type:'address'},{name:'amount',type:'uint256'}], outputs:[{type:'bool'}] },
   { type:'function', name:'allowance', stateMutability:'view', inputs:[{name:'owner',type:'address'},{name:'spender',type:'address'}], outputs:[{type:'uint256'}] },
+  { type:'function', name:'balanceOf', stateMutability:'view', inputs:[{name:'owner',type:'address'}], outputs:[{type:'uint256'}] },
 ] as const;
+const jobCreatedEvent = { type:'event', name:'JobCreated', inputs:[
+  {indexed:true,name:'jobId',type:'uint256'}, {indexed:true,name:'client',type:'address'}, {indexed:true,name:'provider',type:'address'},
+  {indexed:false,name:'evaluator',type:'address'}, {indexed:false,name:'expiredAt',type:'uint256'}
+] } as const;
 
-export const PAYMENT_TOKEN = '0xc70B8741B8B07A6d61E54fd4B20f22fa648e5565' as Address;
 export const publicBscClient = createPublicClient({ chain:bscTestnet, transport:http(import.meta.env.VITE_BSC_TESTNET_RPC_URL || undefined) });
 
 export async function connectWallet() {
@@ -34,32 +38,55 @@ export async function connectWallet() {
 
 async function tx(wallet:any, request:any): Promise<Hash> {
   const hash = await wallet.writeContract(request);
-  await publicBscClient.waitForTransactionReceipt({ hash });
+  const receipt = await publicBscClient.waitForTransactionReceipt({ hash });
+  if (receipt.status !== 'success') throw new Error(`Transaction reverted: ${hash}`);
   return hash;
 }
 
-export async function createAndFundJob(account:Address, wallet:any, provider:Address, budget:bigint, description:string) {
-  const disputeWindow = await publicBscClient.readContract({address:CONTRACTS.optimisticPolicy,abi:policyAbi,functionName:'disputeWindow'});
-  const now = BigInt(Math.floor(Date.now()/1000));
-  const expiredAt = now + disputeWindow + 600n;
-  const createHash = await tx(wallet, { account, address:CONTRACTS.agenticCommerce, abi:commerceAbi, functionName:'createJob', args:[provider,CONTRACTS.evaluatorRouter,expiredAt,description,CONTRACTS.evaluatorRouter] });
-  const receipt = await publicBscClient.getTransactionReceipt({ hash:createHash });
-  const log = receipt.logs.find(l => l.address.toLowerCase() === CONTRACTS.agenticCommerce.toLowerCase() && l.topics.length > 1);
-  const jobId = log?.topics?.[1];
-  if (!jobId) throw new Error('JobCreated event did not contain a jobId');
-  const id = BigInt(jobId);
-  const registered = await publicBscClient.readContract({ address:CONTRACTS.evaluatorRouter, abi:routerAbi, functionName:'policyWhitelist', args:[CONTRACTS.optimisticPolicy] });
-  if (!registered) throw new Error('OptimisticPolicy is not whitelisted by the EvaluatorRouter');
-  await tx(wallet,{account,address:CONTRACTS.evaluatorRouter,abi:routerAbi,functionName:'registerJob',args:[id,CONTRACTS.optimisticPolicy]});
-  const allowance = await publicBscClient.readContract({address:PAYMENT_TOKEN,abi:erc20Abi,functionName:'allowance',args:[account,CONTRACTS.agenticCommerce]});
-  if (allowance < budget) await tx(wallet,{account,address:PAYMENT_TOKEN,abi:erc20Abi,functionName:'approve',args:[CONTRACTS.agenticCommerce,budget]});
-  const fundHash = await tx(wallet,{account,address:CONTRACTS.agenticCommerce,abi:commerceAbi,functionName:'fund',args:[id,budget,'0x']});
-  return { jobId:id, createHash, fundHash };
+async function readJob(jobId: bigint) {
+  return publicBscClient.readContract({ address:CONTRACTS.agenticCommerce, abi:commerceAbi, functionName:'getJob', args:[jobId] });
 }
 
+export async function createAndFundJob(account:Address, wallet:any, provider:Address, budget:bigint, description:string) {
+  if (budget <= 0n) throw new Error('Budget must be greater than zero.');
+  const disputeWindow = await publicBscClient.readContract({address:CONTRACTS.optimisticPolicy,abi:policyAbi,functionName:'disputeWindow'});
+  const paymentToken = await publicBscClient.readContract({address:CONTRACTS.agenticCommerce,abi:commerceAbi,functionName:'paymentToken'});
+  const now = BigInt(Math.floor(Date.now()/1000));
+  const expiredAt = now + disputeWindow + 600n;
+
+  const createHash = await tx(wallet, { account, address:CONTRACTS.agenticCommerce, abi:commerceAbi, functionName:'createJob', args:[provider,CONTRACTS.evaluatorRouter,expiredAt,description,CONTRACTS.evaluatorRouter] });
+  const receipt = await publicBscClient.getTransactionReceipt({ hash:createHash });
+  let jobId: bigint | undefined;
+  for (const log of receipt.logs) {
+    if (log.address.toLowerCase() !== CONTRACTS.agenticCommerce.toLowerCase()) continue;
+    try {
+      const decoded = decodeEventLog({ abi:[jobCreatedEvent], data:log.data, topics:log.topics });
+      if (decoded.eventName === 'JobCreated') { jobId = decoded.args.jobId; break; }
+    } catch { /* ignore unrelated logs */ }
+  }
+  if (jobId === undefined) throw new Error('Could not recover jobId from JobCreated event');
+
+  const jobBeforeRegister = await readJob(jobId);
+  if (jobBeforeRegister.provider.toLowerCase() !== provider.toLowerCase()) throw new Error('On-chain provider does not match selected ERC-8004 agent wallet');
+
+  const registered = await publicBscClient.readContract({ address:CONTRACTS.evaluatorRouter, abi:routerAbi, functionName:'policyWhitelist', args:[CONTRACTS.optimisticPolicy] });
+  if (!registered) throw new Error('OptimisticPolicy is not whitelisted by the EvaluatorRouter');
+  await tx(wallet,{account,address:CONTRACTS.evaluatorRouter,abi:routerAbi,functionName:'registerJob',args:[jobId,CONTRACTS.optimisticPolicy]});
+
+  const allowance = await publicBscClient.readContract({address:paymentToken,abi:erc20Abi,functionName:'allowance',args:[account,CONTRACTS.agenticCommerce]});
+  if (allowance < budget) await tx(wallet,{account,address:paymentToken,abi:erc20Abi,functionName:'approve',args:[CONTRACTS.agenticCommerce,budget]});
+  const balance = await publicBscClient.readContract({address:paymentToken,abi:erc20Abi,functionName:'balanceOf',args:[account]});
+  if (balance < budget) throw new Error(`Insufficient payment-token balance. Need ${budget.toString()} base units.`);
+
+  const fundHash = await tx(wallet,{account,address:CONTRACTS.agenticCommerce,abi:commerceAbi,functionName:'fund',args:[jobId,budget,'0x']});
+  const fundedJob = await readJob(jobId);
+  if (fundedJob.status !== 1) throw new Error(`Job ${jobId.toString()} was not confirmed as FUNDED on-chain (status ${fundedJob.status})`);
+  return { jobId, createHash, fundHash, paymentToken, expiredAt };
+}
+
+export async function getJob(jobId: bigint) { return readJob(jobId); }
 export async function settleJob(account:Address, wallet:any, jobId:bigint) {
   const hash = await tx(wallet,{account,address:CONTRACTS.evaluatorRouter,abi:routerAbi,functionName:'settle',args:[jobId,'0x']});
   return hash;
 }
-
 export function deliverableHash(text:string): `0x${string}` { return keccak256(stringToHex(text)); }
