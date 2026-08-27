@@ -9,8 +9,6 @@ jobs:
   build:
     runs-on: ubuntu-latest
     env:
-      VITE_AGENT0_GRAPH_API_KEY: ${{ secrets.AGENT0_GRAPH_API_KEY }}
-      VITE_AGENT0_SUBGRAPH_ID: ${{ vars.AGENT0_SUBGRAPH_ID }}
       VITE_BSC_TESTNET_RPC_URL: ${{ vars.BSC_TESTNET_RPC_URL }}
     steps:
       - uses: actions/checkout@v4
@@ -18,5 +16,5 @@ jobs:
         with:
           node-version: 20
           cache: npm
-      - run: npm install
+      - run: npm ci
       - run: npm run build
