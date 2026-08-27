@@ -13,6 +13,7 @@ const routerAbi = [
   { type:'function', name:'settle', stateMutability:'nonpayable', inputs:[{name:'jobId',type:'uint256'},{name:'evidence',type:'bytes'}], outputs:[] },
   { type:'function', name:'policyWhitelist', stateMutability:'view', inputs:[{name:'policy',type:'address'}], outputs:[{type:'bool'}] },
 ] as const;
+const policyAbi = [{ type:'function', name:'disputeWindow', stateMutability:'view', inputs:[], outputs:[{type:'uint256'}] }] as const;
 const erc20Abi = [
   { type:'function', name:'approve', stateMutability:'nonpayable', inputs:[{name:'spender',type:'address'},{name:'amount',type:'uint256'}], outputs:[{type:'bool'}] },
   { type:'function', name:'allowance', stateMutability:'view', inputs:[{name:'owner',type:'address'},{name:'spender',type:'address'}], outputs:[{type:'uint256'}] },
@@ -38,11 +39,13 @@ async function tx(wallet:any, request:any): Promise<Hash> {
 }
 
 export async function createAndFundJob(account:Address, wallet:any, provider:Address, budget:bigint, description:string) {
+  const disputeWindow = await publicBscClient.readContract({address:CONTRACTS.optimisticPolicy,abi:policyAbi,functionName:'disputeWindow'});
   const now = BigInt(Math.floor(Date.now()/1000));
-  // BNB Agent SDK's canonical lifecycle uses Router as evaluator and hook.
-  const createHash = await tx(wallet, { account, address:CONTRACTS.agenticCommerce, abi:commerceAbi, functionName:'createJob', args:[provider,CONTRACTS.evaluatorRouter,now+3600n,description,CONTRACTS.evaluatorRouter] });
+  const expiredAt = now + disputeWindow + 600n;
+  const createHash = await tx(wallet, { account, address:CONTRACTS.agenticCommerce, abi:commerceAbi, functionName:'createJob', args:[provider,CONTRACTS.evaluatorRouter,expiredAt,description,CONTRACTS.evaluatorRouter] });
   const receipt = await publicBscClient.getTransactionReceipt({ hash:createHash });
-  const jobId = receipt.logs.find(l => l.address.toLowerCase() === CONTRACTS.agenticCommerce.toLowerCase())?.topics?.[1];
+  const log = receipt.logs.find(l => l.address.toLowerCase() === CONTRACTS.agenticCommerce.toLowerCase() && l.topics.length > 1);
+  const jobId = log?.topics?.[1];
   if (!jobId) throw new Error('JobCreated event did not contain a jobId');
   const id = BigInt(jobId);
   const registered = await publicBscClient.readContract({ address:CONTRACTS.evaluatorRouter, abi:routerAbi, functionName:'policyWhitelist', args:[CONTRACTS.optimisticPolicy] });
@@ -52,6 +55,11 @@ export async function createAndFundJob(account:Address, wallet:any, provider:Add
   if (allowance < budget) await tx(wallet,{account,address:PAYMENT_TOKEN,abi:erc20Abi,functionName:'approve',args:[CONTRACTS.agenticCommerce,budget]});
   const fundHash = await tx(wallet,{account,address:CONTRACTS.agenticCommerce,abi:commerceAbi,functionName:'fund',args:[id,budget,'0x']});
   return { jobId:id, createHash, fundHash };
+}
+
+export async function settleJob(account:Address, wallet:any, jobId:bigint) {
+  const hash = await tx(wallet,{account,address:CONTRACTS.evaluatorRouter,abi:routerAbi,functionName:'settle',args:[jobId,'0x']});
+  return hash;
 }
 
 export function deliverableHash(text:string): `0x${string}` { return keccak256(stringToHex(text)); }
