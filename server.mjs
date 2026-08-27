@@ -2,6 +2,7 @@ import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { extname, join, normalize } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createClient } from '@supabase/supabase-js';
 
 const root = fileURLToPath(new URL('.', import.meta.url));
 const dist = join(root, 'dist');
@@ -10,6 +11,9 @@ const subgraphId = process.env.AGENT0_SUBGRAPH_ID || 'BTjind17gmRZ6YhT9peaCM13Sv
 const apiKey = process.env.AGENT0_GRAPH_API_KEY;
 const endpoint = process.env.AGENT0_GRAPH_URL || `https://gateway.thegraph.com/api/subgraphs/id/${subgraphId}`;
 const providerAddress = process.env.AGENTFORGE_PROVIDER_ADDRESS || '';
+const supabaseUrl = process.env.SUPABASE_URL || '';
+const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
+const supabase = supabaseUrl && supabaseServiceRoleKey ? createClient(supabaseUrl, supabaseServiceRoleKey, { auth: { persistSession: false, autoRefreshToken: false } }) : null;
 const query = `query Agents($first: Int!, $skip: Int!) {
   agents(first: $first, skip: $skip, orderBy: lastActivity, orderDirection: desc) {
     id agentId chainId owner agentWallet agentURI
@@ -22,6 +26,13 @@ const query = `query Agents($first: Int!, $skip: Int!) {
 function json(res, status, body) {
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
   res.end(JSON.stringify(body));
+}
+
+async function readBody(req) {
+  let body = '';
+  for await (const chunk of req) body += chunk;
+  if (body.length > 100_000) throw new Error('Request body too large');
+  return JSON.parse(body || '{}');
 }
 
 async function agents(req, res) {
@@ -47,12 +58,44 @@ function provider(req, res) {
   return json(res, 200, { configured: Boolean(providerAddress), address: providerAddress || null, chainId: 97 });
 }
 
+async function executions(req, res) {
+  if (!supabase) return json(res, 503, { error: 'Supabase persistence is not configured on the server' });
+  try {
+    if (req.method === 'GET') {
+      const url = new URL(req.url, `http://${req.headers.host}`);
+      const wallet = (url.searchParams.get('wallet') || '').trim().toLowerCase();
+      if (!/^0x[a-f0-9]{40}$/.test(wallet)) return json(res, 400, { error: 'A valid wallet address is required' });
+      const { data, error } = await supabase.from('agentforge_executions').select('*').eq('wallet', wallet).order('created_at', { ascending: false }).limit(50);
+      if (error) return json(res, 502, { error: error.message });
+      return json(res, 200, { executions: (data ?? []).map(row => ({ id:row.id, agentId:row.agent_id, agentName:row.agent_name, wallet:row.wallet, chainId:row.chain_id, protocol:row.protocol, jobId:row.job_id, createHash:row.create_hash, fundHash:row.fund_hash, status:row.status, createdAt:row.created_at })) });
+    }
+    if (req.method === 'POST') {
+      const body = await readBody(req);
+      const wallet = String(body.wallet || '').trim().toLowerCase();
+      if (!/^0x[a-f0-9]{40}$/.test(wallet)) return json(res, 400, { error: 'Invalid wallet address' });
+      const row = {
+        id: String(body.id || ''), agent_id:String(body.agentId || ''), agent_name:String(body.agentName || ''), wallet,
+        chain_id:97, protocol:'ERC-8183', job_id:String(body.jobId || ''), create_hash:String(body.createHash || ''), fund_hash:String(body.fundHash || ''),
+        status:String(body.status || ''), created_at:String(body.createdAt || new Date().toISOString()), updated_at:new Date().toISOString()
+      };
+      if (!row.id || !row.agent_id || !row.agent_name || !row.job_id || !row.create_hash || !row.fund_hash || !['FUNDED','CONFIRMED','VERIFIED','FAILED'].includes(row.status)) return json(res, 400, { error: 'Invalid execution record' });
+      const { data, error } = await supabase.from('agentforge_executions').upsert(row, { onConflict:'id' }).select().single();
+      if (error) return json(res, 502, { error: error.message });
+      return json(res, 200, { execution:{ id:data.id, agentId:data.agent_id, agentName:data.agent_name, wallet:data.wallet, chainId:data.chain_id, protocol:data.protocol, jobId:data.job_id, createHash:data.create_hash, fundHash:data.fund_hash, status:data.status, createdAt:data.created_at } });
+    }
+    return json(res, 405, { error: 'Method not allowed' });
+  } catch (error) {
+    return json(res, 400, { error: error instanceof Error ? error.message : 'Invalid request' });
+  }
+}
+
 const mime = { '.html':'text/html; charset=utf-8', '.js':'text/javascript; charset=utf-8', '.css':'text/css; charset=utf-8', '.json':'application/json; charset=utf-8', '.svg':'image/svg+xml', '.png':'image/png', '.ico':'image/x-icon' };
 
 createServer(async (req, res) => {
   try {
     if (req.url?.startsWith('/api/agents')) return agents(req, res);
     if (req.url?.startsWith('/api/provider')) return provider(req, res);
+    if (req.url?.startsWith('/api/executions')) return executions(req, res);
     if (req.method !== 'GET' && req.method !== 'HEAD') return json(res, 405, { error: 'Method not allowed' });
     const pathname = new URL(req.url || '/', `http://${req.headers.host}`).pathname;
     const safe = normalize(pathname).replace(/^([.][.][/\\])+/, '');
