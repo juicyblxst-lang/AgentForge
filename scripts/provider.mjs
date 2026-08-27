@@ -21,6 +21,7 @@ if (!agentUrl) throw new Error("ERC8183_AGENT_URL is required for the provider w
 const port = Number(process.env.PORT || 3000);
 const AGENTIC_COMMERCE = "0xa206c0517b6371c6638cd9e4a42cc9f02a33b0de";
 const LOG_CHUNK_SIZE = BigInt(process.env.ERC8183_LOG_CHUNK_SIZE || "500");
+const MIN_LOG_CHUNK_SIZE = 10n;
 const wallet = new EVMWalletProvider({ password: process.env.WALLET_PASSWORD, privateKey: process.env.PRIVATE_KEY });
 const client = await ERC8183Client.create({ walletProvider: wallet, network });
 const jobOps = await ERC8183JobOps.create({
@@ -39,6 +40,32 @@ const jobCreatedEvent = parseAbiItem(
 const budgeted = new Set();
 let lastScannedBlock = null;
 
+function isRpcLogLimitError(error) {
+  const text = error instanceof Error ? error.message : String(error);
+  return text.includes("LimitExceededRpcError") || text.includes("limit exceeded") || text.includes("Request exceeds defined limit") || error?.cause?.code === -32005;
+}
+
+async function getLogsInAdaptiveChunks(fromBlock, toBlock) {
+  const logs = [];
+  let start = fromBlock;
+  let chunkSize = LOG_CHUNK_SIZE;
+
+  while (start <= toBlock) {
+    const end = start + chunkSize - 1n > toBlock ? toBlock : start + chunkSize - 1n;
+    try {
+      const chunk = await publicClient.getLogs({ address: AGENTIC_COMMERCE, event: jobCreatedEvent, fromBlock: start, toBlock: end });
+      logs.push(...chunk);
+      start = end + 1n;
+      if (chunkSize < LOG_CHUNK_SIZE) chunkSize = chunkSize * 2n > LOG_CHUNK_SIZE ? LOG_CHUNK_SIZE : chunkSize * 2n;
+    } catch (error) {
+      if (!isRpcLogLimitError(error) || chunkSize <= MIN_LOG_CHUNK_SIZE) throw error;
+      chunkSize = chunkSize / 2n;
+      console.warn(`[provider] RPC log limit at ${start}-${end}; reducing log chunk size to ${chunkSize}`);
+    }
+  }
+  return logs;
+}
+
 const httpServer = createServer((req, res) => {
   if (req.method === "GET" && req.url === "/status") {
     res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
@@ -56,23 +83,13 @@ const httpServer = createServer((req, res) => {
 
 httpServer.listen(port, () => console.log(`[provider] HTTP status server listening on :${port}`));
 
-async function getJobCreatedLogs(fromBlock, toBlock) {
-  const logs = [];
-  for (let start = fromBlock; start <= toBlock; start += LOG_CHUNK_SIZE) {
-    const end = start + LOG_CHUNK_SIZE - 1n > toBlock ? toBlock : start + LOG_CHUNK_SIZE - 1n;
-    const chunk = await publicClient.getLogs({ address: AGENTIC_COMMERCE, event: jobCreatedEvent, fromBlock: start, toBlock: end });
-    logs.push(...chunk);
-  }
-  return logs;
-}
-
 async function setBudgetsForOpenJobs() {
   const latest = await publicClient.getBlockNumber();
   const initialWindow = BigInt(process.env.ERC8183_INITIAL_SCAN_BLOCKS || "5000");
   const fromBlock = lastScannedBlock === null ? (latest > initialWindow ? latest - initialWindow : 0n) : lastScannedBlock + 1n;
   if (fromBlock > latest) return;
 
-  const logs = await getJobCreatedLogs(fromBlock, latest);
+  const logs = await getLogsInAdaptiveChunks(fromBlock, latest);
   lastScannedBlock = latest;
 
   for (const log of logs) {
