@@ -38,7 +38,6 @@ function App() {
         const accounts=await ethereum.request({method:'eth_accounts'}) as string[];
         if(cancelled||!accounts?.[0]) return;
         const account=accounts[0] as `0x${string}`;
-        setWallet(current=>current??{wallet:ethereum,account});
         await hydrateHistory(account);
       } catch { /* local history remains available as fallback */ }
     }
@@ -65,7 +64,7 @@ function App() {
       try{await persistRemoteExecution(stored)}catch{/* local fallback */}
 
       setStatus(`Job #${value.jobId} funded. Waiting for provider submission…`);
-      const submittedJob=await waitForJobStatus(value.jobId,'SUBMITTED',300_000,(chainStatus)=>{
+      await waitForJobStatus(value.jobId,'SUBMITTED',300_000,(chainStatus)=>{
         if(chainStatus==='FUNDED')setStatus(`Job #${value.jobId} funded. Provider is working…`);
       });
       const submittedAt=new Date().toISOString();
