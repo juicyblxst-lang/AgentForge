@@ -1,0 +1,28 @@
+name: Register AgentForge Provider
+
+on:
+  workflow_dispatch:
+
+jobs:
+  register:
+    runs-on: ubuntu-latest
+    env:
+      NETWORK: bsc-testnet
+      PRIVATE_KEY: ${{ secrets.PRIVATE_KEY }}
+      WALLET_PASSWORD: ${{ secrets.WALLET_PASSWORD }}
+      ERC8183_AGENT_URL: https://agentforge-9bms.onrender.com
+      AGENT_NAME: AgentForge Provider
+      AGENT_DESCRIPTION: AgentForge controlled ERC-8183 BSC Testnet provider for marketplace execution demos.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm install
+      - name: Validate registration secrets
+        run: |
+          test -n "$PRIVATE_KEY" || { echo "PRIVATE_KEY secret is missing"; exit 1; }
+          test -n "$WALLET_PASSWORD" || { echo "WALLET_PASSWORD secret is missing"; exit 1; }
+      - name: Register AgentForge provider
+        run: node scripts/register-provider.mjs
