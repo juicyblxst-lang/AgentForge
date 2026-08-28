@@ -161,7 +161,11 @@ async function pollJobs() {
           processedAt: new Date().toISOString(),
         });
 
-        const result = await jobOps.submitResult(job.id, deliverable, {
+        // The SDK's Job type uses bigint for the on-chain job id, while
+        // ERC8183JobOps.submitResult() expects a JSON-manifest-safe number.
+        // Passing job.id directly makes DeliverableManifest canonical JSON
+        // throw "Do not know how to serialize a BigInt" before submit().
+        const result = await jobOps.submitResult(Number(job.id), deliverable, {
           agentforge: true,
           worker: "agentforge-provider-v1",
         });
