@@ -21,7 +21,7 @@ const erc20Abi = [
 ] as const;
 const jobCreatedEvent = { type:'event', name:'JobCreated', inputs:[
   {indexed:true,name:'jobId',type:'uint256'}, {indexed:true,name:'client',type:'address'}, {indexed:true,name:'provider',type:'address'},
-  {indexed:false,name:'evaluator',type:'address'}, {indexed:false,name:'expiredAt',type:'uint256'}
+  {indexed:false,name:'evaluator',type:'address'}, {indexed:false,name:'expiredAt',type:'uint256'}, {indexed:false,name:'hook',type:'address'}
 ] } as const;
 
 export const publicBscClient = createPublicClient({ chain:bscTestnet, transport:http(import.meta.env.VITE_BSC_TESTNET_RPC_URL || undefined) });
