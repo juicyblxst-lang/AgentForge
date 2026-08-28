@@ -2,7 +2,7 @@ import React from 'react';
 import { createRoot } from 'react-dom/client';
 import './styles.css';
 import { discoverBscAgents, type MarketplaceAgent } from './lib/discovery';
-import { getAgentIdentity } from './lib/erc8004';
+import { getAgentIdentity, verifyAgentCapabilities, type CapabilityVerification } from './lib/erc8004';
 import { connectWallet, createAndFundJob, getJob, waitForJobStatus } from './lib/erc8183';
 import { listStoredExecutions, saveStoredExecution, syncExecution, type StoredExecution } from './lib/executionStore';
 import { loadRemoteExecutions, persistRemoteExecution } from './lib/remoteExecutionStore';
@@ -16,7 +16,7 @@ const DEMO_BUDGET = 10_000_000_000_000_000n; // 0.01 U
 function App() {
   const [category,setCategory]=React.useState('All agents'); const [agents,setAgents]=React.useState<MarketplaceAgent[]>([]);
   const [selected,setSelected]=React.useState<MarketplaceAgent|null>(null); const [wallet,setWallet]=React.useState<{wallet:any;account:`0x${string}`}|null>(null);
-  const [identity,setIdentity]=React.useState<any>(null); const [status,setStatus]=React.useState('Loading Agent0…'); const [busy,setBusy]=React.useState(false);
+  const [identity,setIdentity]=React.useState<any>(null); const [capability,setCapability]=React.useState<CapabilityVerification|null>(null); const [status,setStatus]=React.useState('Loading Agent0…'); const [busy,setBusy]=React.useState(false);
   const [result,setResult]=React.useState<any>(null); const [history,setHistory]=React.useState<StoredExecution[]>([]);
   const [providerAddress,setProviderAddress]=React.useState<string|null>(null);
 
@@ -45,7 +45,18 @@ function App() {
     return ()=>{cancelled=true};
   },[load,hydrateHistory]);
 
-  async function openAgent(agent:MarketplaceAgent){setSelected(agent);setResult(null);setIdentity(null);try{setStatus('Reading ERC-8004 identity from BSC…');setIdentity(await getAgentIdentity(BigInt(agent.agentId)));setStatus('ERC-8004 identity verified')}catch(e){setStatus(e instanceof Error?e.message:'Identity verification failed')}}
+  async function openAgent(agent:MarketplaceAgent){
+    setSelected(agent);setResult(null);setIdentity(null);setCapability(null);
+    try{
+      setStatus('Reading ERC-8004 identity from BSC…');
+      const nextIdentity=await getAgentIdentity(BigInt(agent.agentId));
+      setIdentity(nextIdentity);
+      setStatus('Verifying ERC-8004 registration and capabilities…');
+      const nextCapability=await verifyAgentCapabilities(nextIdentity);
+      setCapability(nextCapability);
+      setStatus(nextCapability.verified?'ERC-8004 identity + capability verified':`Capability verification failed: ${nextCapability.reason}`);
+    }catch(e){setStatus(e instanceof Error?e.message:'Identity/capability verification failed')}
+  }
   async function connect(){try{const connected=await connectWallet();setWallet(connected);setStatus('Wallet connected on BSC Testnet');await hydrateHistory(connected.account)}catch(e){setStatus(e instanceof Error?e.message:'Wallet connection failed')}}
 
   async function execute(){
@@ -54,6 +65,7 @@ function App() {
     if(!selected.agentWallet||selected.agentWallet.toLowerCase()!==providerAddress.toLowerCase())return setStatus('This agent is discoverable, but it is not the AgentForge executable provider. Execution is blocked.');
     if(!wallet){await connect();return}
     if(!identity)return setStatus('Verify the agent identity first.');
+    if(!capability?.verified)return setStatus(capability?.reason||'Verify the agent capability first.');
     setBusy(true);
     let stored:StoredExecution|undefined;
     try{
@@ -89,9 +101,9 @@ function App() {
   return <main className="shell"><header className="nav"><div className="brand">AGENTFORGE</div><div className="network"><span/> BSC Testnet · 97</div><button className="wallet" onClick={connect}>{wallet?`${wallet.account.slice(0,6)}…${wallet.account.slice(-4)}`:'Connect wallet'}</button></header>
     <section className="hero"><p className="eyebrow">ERC-8004 AGENT MARKETPLACE</p><h1>Find an agent.<br/>Verify it. Execute.</h1><p className="lede">Real Agent0 discovery, on-chain ERC-8004 identity verification and ERC-8183 commerce on BSC Testnet.</p></section>
     <section className="market"><div className="toolbar"><div className="categories">{categories.map(item=><button key={item} className={category===item?'active':''} onClick={()=>setCategory(item)}>{item}</button>)}</div><button className="refresh" onClick={()=>void load()}>Refresh</button></div><p className="status">{status}</p>
-      {selected?<section className="detail"><button className="back" onClick={()=>setSelected(null)}>← Marketplace</button><div className="detail-head"><div><p className="eyebrow">AGENT DETAIL</p><h2>{selected.name}</h2><p>{selected.description||'ERC-8004 registered agent on BSC Testnet.'}</p></div><span className="verified">{identity?'✓ Identity verified':'Verifying…'}</span></div>
-        <div className="facts"><div><small>AGENT ID</small><strong>{selected.agentId}</strong></div><div><small>OWNER</small><strong>{identity?.owner||selected.owner||'—'}</strong></div><div><small>AGENT WALLET</small><strong>{identity?.agentWallet||selected.agentWallet||'—'}</strong></div><div><small>CAPABILITIES</small><strong>{selected.capabilities.join(', ')||'None declared'}</strong></div></div>
-        <div className="permission-panel"><p className="eyebrow">AUTHORIZATION</p><h2>Review execution</h2><p>AgentForge will create an ERC-8183 job for this agent and fund it with 0.01 U from your connected BSC Testnet wallet. You will approve the wallet transactions.</p><div className="facts"><div><small>NETWORK</small><strong>BSC Testnet (97)</strong></div><div><small>PROTOCOL</small><strong>ERC-8183</strong></div><div><small>MAX PAYMENT</small><strong>0.01 U</strong></div></div><button className="authorize" disabled={busy||!identity||!providerAddress||!selected.agentWallet||selected.agentWallet.toLowerCase()!==providerAddress.toLowerCase()} onClick={()=>void execute()}>{busy?'Executing…':!providerAddress?'Provider not configured':selected.agentWallet?.toLowerCase()!==providerAddress?.toLowerCase()?'Not executable provider':wallet?'Authorize & execute':'Connect wallet to execute'}</button></div>
+      {selected?<section className="detail"><button className="back" onClick={()=>setSelected(null)}>← Marketplace</button><div className="detail-head"><div><p className="eyebrow">AGENT DETAIL</p><h2>{selected.name}</h2><p>{selected.description||'ERC-8004 registered agent on BSC Testnet.'}</p></div><span className="verified">{capability?.verified?'✓ Identity + capability verified':identity?'✓ Identity verified':'Verifying…'}</span></div>
+        <div className="facts"><div><small>AGENT ID</small><strong>{selected.agentId}</strong></div><div><small>OWNER</small><strong>{identity?.owner||selected.owner||'—'}</strong></div><div><small>AGENT WALLET</small><strong>{identity?.agentWallet||selected.agentWallet||'—'}</strong></div><div><small>CAPABILITIES</small><strong>{(capability?.capabilities.length?capability.capabilities:selected.capabilities).join(', ')||'None declared'}</strong></div></div>
+        <div className="permission-panel"><p className="eyebrow">AUTHORIZATION</p><h2>Review execution</h2><p>AgentForge will create an ERC-8183 job for this agent and fund it with 0.01 U from your connected BSC Testnet wallet. You will approve the wallet transactions.</p><div className="facts"><div><small>NETWORK</small><strong>BSC Testnet (97)</strong></div><div><small>PROTOCOL</small><strong>ERC-8183</strong></div><div><small>MAX PAYMENT</small><strong>0.01 U</strong></div></div><button className="authorize" disabled={busy||!identity||!capability?.verified||!providerAddress||!selected.agentWallet||selected.agentWallet.toLowerCase()!==providerAddress.toLowerCase()} onClick={()=>void execute()}>{busy?'Executing…':!providerAddress?'Provider not configured':!capability?.verified?'Capability verification required':selected.agentWallet?.toLowerCase()!==providerAddress?.toLowerCase()?'Not executable provider':wallet?'Authorize & execute':'Connect wallet to execute'}</button></div>
         {result&&<div className="result"><p className="eyebrow">ON-CHAIN RESULT</p><strong>Job #{String(result.jobId)} · {result.verified?'VERIFIED':'FAILED VERIFICATION'}</strong><p>Create: {result.createHash}</p><p>Fund: {result.fundHash}</p><p>Provider submission status: {result.job?.status===2?'SUBMITTED':'—'}</p></div>}
       </section>:<><div className="agents">{visible.length?visible.map(agent=><AgentCard key={agent.id} agent={agent} onOpen={()=>void openAgent(agent)}/>):<div className="empty-state"><div className="orb">A</div><p className="eyebrow">{status}</p><h2>No agents loaded</h2><p>{category==='All agents'?'Set the Agent0 Graph API key in the environment, then refresh.':`No discovered agents are currently classified as ${category}.`}</p></div>}</div>{history.length>0&&<div className="history"><p className="eyebrow">EXECUTION HISTORY · SURVIVES REFRESH</p>{history.slice(0,5).map(x=><div className="history-row" key={x.id}><strong>#{x.jobId} · {x.agentName}</strong><span>{x.status}</span><code>{x.fundHash.slice(0,12)}…</code></div>)}</div>}</>}
     </section></main>
