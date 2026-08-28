@@ -92,7 +92,8 @@ async function pollJobs() {
     const counter = await client.commerce.jobCounter();
     const newJobIds = [];
 
-    for (let id = lastKnownJobCounter; id < counter; id += 1n) {
+    // jobId = ++jobCounter, so the current counter value is the newest job id.
+    for (let id = lastKnownJobCounter + 1n; id <= counter; id += 1n) {
       newJobIds.push(id);
     }
     lastKnownJobCounter = counter;
