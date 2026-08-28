@@ -26,7 +26,26 @@ function App() {
   },[]);
 
   const load=React.useCallback(async()=>{try{setStatus('Discovering real BSC Testnet agents…');const [discovered,provider]=await Promise.all([discoverBscAgents(),fetch('/api/provider').then(r=>r.json())]);setAgents(discovered);setProviderAddress(provider.address||null);setStatus(provider.address?'Live Agent0 discovery · provider ready':'Live Agent0 discovery · provider not configured')}catch(e){setStatus(e instanceof Error?e.message:'Discovery failed')}},[]);
-  React.useEffect(()=>{void load();setHistory(listStoredExecutions())},[load]);
+
+  React.useEffect(()=>{
+    void load();
+    setHistory(listStoredExecutions());
+    let cancelled=false;
+    async function hydrateConnectedWallet(){
+      try {
+        const ethereum=(window as any).ethereum;
+        if(!ethereum) return;
+        const accounts=await ethereum.request({method:'eth_accounts'}) as string[];
+        if(cancelled||!accounts?.[0]) return;
+        const account=accounts[0] as `0x${string}`;
+        setWallet(current=>current??{wallet:ethereum,account});
+        await hydrateHistory(account);
+      } catch { /* local history remains available as fallback */ }
+    }
+    void hydrateConnectedWallet();
+    return ()=>{cancelled=true};
+  },[load,hydrateHistory]);
+
   async function openAgent(agent:MarketplaceAgent){setSelected(agent);setResult(null);setIdentity(null);try{setStatus('Reading ERC-8004 identity from BSC…');setIdentity(await getAgentIdentity(BigInt(agent.agentId)));setStatus('ERC-8004 identity verified')}catch(e){setStatus(e instanceof Error?e.message:'Identity verification failed')}}
   async function connect(){try{const connected=await connectWallet();setWallet(connected);setStatus('Wallet connected on BSC Testnet');await hydrateHistory(connected.account)}catch(e){setStatus(e instanceof Error?e.message:'Wallet connection failed')}}
 
