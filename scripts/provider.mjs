@@ -70,6 +70,7 @@ httpServer.listen(port, () => console.log(`[provider] HTTP status server listeni
 
 const budgeted = new Set();
 const funded = new Set();
+const open = new Set();
 let lastKnownJobCounter = 0n;
 let polling = false;
 
@@ -98,11 +99,11 @@ async function pollJobs() {
 
     for (const job of await readJobs(newJobIds)) {
       if (job.provider.toLowerCase() !== jobOps.agentAddress.toLowerCase()) continue;
-      if (job.status === 0) budgeted.add(job.id.toString());
+      if (job.status === 0) open.add(job.id.toString());
       if (job.status === 1) funded.add(job.id.toString());
     }
 
-    const tracked = new Set([...budgeted, ...funded]);
+    const tracked = new Set([...open, ...budgeted, ...funded]);
     const openIds = new Set();
     const fundedIds = new Set();
 
@@ -110,6 +111,7 @@ async function pollJobs() {
       try {
         const job = await client.getJob(BigInt(key));
         if (job.provider.toLowerCase() !== jobOps.agentAddress.toLowerCase()) {
+          open.delete(key);
           budgeted.delete(key);
           funded.delete(key);
           continue;
@@ -117,6 +119,7 @@ async function pollJobs() {
         if (job.status === 0) openIds.add(key);
         else if (job.status === 1) fundedIds.add(key);
         else {
+          open.delete(key);
           budgeted.delete(key);
           funded.delete(key);
         }
@@ -131,6 +134,7 @@ async function pollJobs() {
         const result = await client.setBudget(BigInt(key), servicePrice);
         console.log(`[provider] set budget for #${key}: ${result.txHash || result.transactionHash || "submitted"}`);
         budgeted.add(key);
+        open.delete(key);
       } catch (error) {
         console.error(`[provider] setBudget failed for #${key}:`, error instanceof Error ? error.message : error);
       }
