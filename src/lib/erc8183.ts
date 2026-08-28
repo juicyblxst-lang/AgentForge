@@ -39,7 +39,9 @@ async function discoverEvmProvider(): Promise<Eip1193Provider | undefined> {
   const injected = win.ethereum;
   if (injected) {
     const candidates = Array.isArray(injected) ? injected : [injected];
-    return candidates.find((candidate) => (candidate as any).isMetaMask) || candidates[0];
+    const metamask = candidates.find((candidate) => (candidate as any).isMetaMask);
+    if (metamask) return metamask;
+    if (candidates.length) return candidates[0];
   }
   return new Promise((resolve) => {
     const providers: Eip6963Detail[] = [];
@@ -54,18 +56,25 @@ async function discoverEvmProvider(): Promise<Eip1193Provider | undefined> {
     };
     window.addEventListener('eip6963:announceProvider', onAnnounce as EventListener);
     window.dispatchEvent(new Event('eip6963:requestProvider'));
-    window.setTimeout(finish, 300);
+    window.setTimeout(finish, 750);
   });
 }
 
 export async function connectWallet() {
   const provider = await discoverEvmProvider();
   if (!provider) throw new Error('MetaMask was not detected in this browser. Make sure the MetaMask extension is installed and enabled, then refresh AgentForge.');
-  const wallet = createWalletClient({ chain:bscTestnet, transport:custom(provider) });
-  const [account] = await wallet.requestAddresses();
-  const chainId = await wallet.getChainId();
-  if (chainId !== 97) await wallet.switchChain({ id:97 });
-  return { wallet, account: account as Address };
+  try {
+    await provider.request({ method:'eth_requestAccounts' });
+    const wallet = createWalletClient({ chain:bscTestnet, transport:custom(provider) });
+    const [account] = await wallet.getAddresses();
+    if (!account) throw new Error('MetaMask did not return an account. Unlock MetaMask and approve the connection.');
+    const chainId = await wallet.getChainId();
+    if (chainId !== 97) await wallet.switchChain({ id:97 });
+    return { wallet, account: account as Address };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`Wallet connection failed: ${message}`);
+  }
 }
 
 async function tx(wallet:any, request:any): Promise<Hash> {
