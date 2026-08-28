@@ -4,8 +4,6 @@ export type MarketplaceAgent = {
   categories: string[]; mcpEndpoint?: string; a2aEndpoint?: string; active?: boolean;
 };
 
-const query = `query Agents($first: Int!, $skip: Int!) { agents(first: $first, skip: $skip, orderBy: lastActivity, orderDirection: desc) { id agentId chainId owner agentWallet agentURI registrationFile { name description active mcpEndpoint a2aEndpoint mcpTools a2aSkills services supportedTrust supportedTrusts x402Support } } }`;
-
 const categoryKeywords: Record<string, string[]> = {
   Research: ['research', 'search', 'query', 'knowledge', 'analysis', 'analyze', 'data', 'information', 'summarize', 'document'],
   Trading: ['trading', 'trade', 'trader', 'market', 'price', 'swap', 'order', 'portfolio', 'arbitrage', 'signal'],
@@ -16,7 +14,13 @@ const categoryKeywords: Record<string, string[]> = {
 function collectCapabilities(rf: any): string[] {
   const values: string[] = [];
   const add = (value: unknown) => { if (typeof value === 'string' && value.trim()) values.push(value.trim()); };
-  const addArray = (value: unknown) => { if (Array.isArray(value)) value.forEach(item => { if (typeof item === 'string') add(item); else if (item && typeof item === 'object') add((item as any).name ?? (item as any).id ?? (item as any).description); }); };
+  const addArray = (value: unknown) => {
+    if (!Array.isArray(value)) return;
+    value.forEach(item => {
+      if (typeof item === 'string') add(item);
+      else if (item && typeof item === 'object') add((item as any).name ?? (item as any).id ?? (item as any).description);
+    });
+  };
   addArray(rf.mcpTools); addArray(rf.a2aSkills); addArray(rf.skills); addArray(rf.tools); addArray(rf.capabilities);
   if (Array.isArray(rf.services)) rf.services.forEach((service: any) => {
     add(service?.name);
@@ -32,8 +36,12 @@ function classifyAgent(name: string, description: string | undefined, capabiliti
     .map(([category]) => category);
 }
 
-export async function discoverBscAgents(first = 20): Promise<MarketplaceAgent[]> {
-  const response = await fetch(`/api/agents?first=${first}`);
+export async function discoverBscAgents(first = 100, skip = 0): Promise<MarketplaceAgent[]> {
+  // Query BSC Testnet at the source instead of requesting a global slice and
+  // filtering it client-side. This prevents the marketplace from accidentally
+  // showing only one BSC agent when the global index is dominated by other chains.
+  const params = new URLSearchParams({ first: String(Math.min(Math.max(first, 1), 100)), skip: String(Math.max(skip, 0)), chainId: '97' });
+  const response = await fetch(`/api/agents?${params.toString()}`);
   if (!response.ok) throw new Error(`Agent discovery failed (${response.status})`);
   const data = await response.json() as { agents?: any[]; error?: string };
   if (data.error) throw new Error(data.error);
