@@ -3,10 +3,11 @@ import { bscTestnet } from 'viem/chains';
 import { CONTRACTS } from './chain';
 
 const commerceAbi = [
-  { type: 'function', name: 'createJob', stateMutability: 'nonpayable', inputs: [{ name:'provider',type:'address' },{ name:'evaluator',type:'address' },{ name:'expiredAt',type:'uint256' },{ name:'description',type:'string' },{ name:'hook',type:'address' }], outputs: [] },
+  { type: 'function', name: 'createJob', stateMutability: 'nonpayable', inputs: [{ name:'provider',type:'address' },{ name:'evaluator',type:'address' },{ name:'expiredAt',type:'uint256' },{ name:'description',type:'string' },{ name:'hook',type:'address' }], outputs: [{ type:'uint256' }] },
   { type: 'function', name: 'fund', stateMutability: 'nonpayable', inputs: [{name:'jobId',type:'uint256'},{name:'expectedBudget',type:'uint256'},{name:'optParams',type:'bytes'}], outputs: [] },
   { type: 'function', name: 'paymentToken', stateMutability:'view', inputs:[], outputs:[{type:'address'}] },
-  { type: 'function', name: 'getJob', stateMutability:'view', inputs:[{name:'jobId',type:'uint256'}], outputs:[{name:'job',type:'tuple',components:[{name:'id',type:'uint256'},{name:'client',type:'address'},{name:'provider',type:'address'},{name:'evaluator',type:'address'},{name:'description',type:'string'},{name:'budget',type:'uint256'},{name:'expiredAt',type:'uint256'},{name:'status',type:'uint8'},{name:'hook',type:'address'},{name:'submittedAt',type:'uint256'},{name:'deliverable',type:'bytes32'}]}] },
+  { type: 'function', name: 'jobCounter', stateMutability:'view', inputs:[], outputs:[{type:'uint256'}] },
+  { type: 'function', name: 'getJob', stateMutability:'view', inputs:[{name:'jobId',type:'uint256'}], outputs:[{name:'job',type:'tuple',components:[{name:'id',type:'uint256'},{name:'client',type:'address'},{name:'provider',type:'address'},{name:'evaluator',type:'address'},{name:'description',type:'string'},{name:'budget',type:'uint256'},{name:'expiredAt',type:'uint256'},{name:'status',type:'uint8'},{name:'hook',type:'address'}]}] },
 ] as const;
 const routerAbi = [
   { type:'function', name:'registerJob', stateMutability:'nonpayable', inputs:[{name:'jobId',type:'uint256'},{name:'policy',type:'address'}], outputs:[] },
@@ -97,20 +98,45 @@ async function waitForProviderBudget(jobId: bigint, expected: bigint, timeoutMs 
   throw new Error(`Provider did not set the ERC-8183 budget within ${Math.floor(timeoutMs / 1000)} seconds. The provider worker must be running and assigned to this agent.`);
 }
 
+async function recoverCreatedJobId(receipt: Awaited<ReturnType<typeof publicBscClient.getTransactionReceipt>>, counterBefore: bigint, counterAfter: bigint): Promise<bigint> {
+  for (const log of receipt.logs) {
+    if (log.address.toLowerCase() !== CONTRACTS.agenticCommerce.toLowerCase()) continue;
+    try {
+      const decoded = decodeEventLog({ abi:[jobCreatedEvent], data:log.data, topics:log.topics });
+      if (decoded.eventName === 'JobCreated') return decoded.args.jobId;
+    } catch { /* fall through to on-chain counter recovery */ }
+  }
+
+  if (counterAfter <= counterBefore) {
+    throw new Error(`createJob was mined but no JobCreated event could be decoded and jobCounter did not advance (before ${counterBefore}, after ${counterAfter}).`);
+  }
+
+  // The event decoder is a convenience, not the source of truth. The contract's
+  // monotonically increasing jobCounter lets us recover a mined job even if an
+  // RPC provider returns an unexpected event shape.
+  const candidates: bigint[] = [];
+  for (let id = counterBefore + 1n; id <= counterAfter; id++) candidates.push(id);
+  for (const id of candidates) {
+    try {
+      const job = await readJob(id);
+      if (job.id === id) return id;
+    } catch { /* keep checking the small newly-created range */ }
+  }
+
+  throw new Error(`createJob was mined and jobCounter advanced from ${counterBefore} to ${counterAfter}, but the new job could not be read back from AgenticCommerce.`);
+}
+
 export async function createAndFundJob(account:Address, wallet:any, provider:Address, budget:bigint, description:string) {
   if (budget <= 0n) throw new Error('Budget must be greater than zero.');
   const disputeWindow = await publicBscClient.readContract({address:CONTRACTS.optimisticPolicy,abi:policyAbi,functionName:'disputeWindow'});
   const paymentToken = await publicBscClient.readContract({address:CONTRACTS.agenticCommerce,abi:commerceAbi,functionName:'paymentToken'});
+  const counterBefore = await publicBscClient.readContract({address:CONTRACTS.agenticCommerce,abi:commerceAbi,functionName:'jobCounter'});
   const now = BigInt(Math.floor(Date.now()/1000));
   const expiredAt = now + disputeWindow + 600n;
   const createHash = await tx(wallet, { account, address:CONTRACTS.agenticCommerce, abi:commerceAbi, functionName:'createJob', args:[provider,CONTRACTS.evaluatorRouter,expiredAt,description,CONTRACTS.evaluatorRouter] });
   const receipt = await publicBscClient.getTransactionReceipt({ hash:createHash });
-  let jobId: bigint | undefined;
-  for (const log of receipt.logs) {
-    if (log.address.toLowerCase() !== CONTRACTS.agenticCommerce.toLowerCase()) continue;
-    try { const decoded = decodeEventLog({ abi:[jobCreatedEvent], data:log.data, topics:log.topics }); if (decoded.eventName === 'JobCreated') { jobId = decoded.args.jobId; break; } } catch { /* ignore unrelated logs */ }
-  }
-  if (jobId === undefined) throw new Error('Could not recover jobId from JobCreated event');
+  const counterAfter = await publicBscClient.readContract({address:CONTRACTS.agenticCommerce,abi:commerceAbi,functionName:'jobCounter'});
+  const jobId = await recoverCreatedJobId(receipt, counterBefore, counterAfter);
   const jobBeforeRegister = await readJob(jobId);
   if (jobBeforeRegister.provider.toLowerCase() !== provider.toLowerCase()) throw new Error('On-chain provider does not match selected ERC-8004 agent wallet');
   const registered = await publicBscClient.readContract({ address:CONTRACTS.evaluatorRouter, abi:routerAbi, functionName:'policyWhitelist', args:[CONTRACTS.optimisticPolicy] });
