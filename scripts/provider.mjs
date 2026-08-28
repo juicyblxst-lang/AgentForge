@@ -71,7 +71,6 @@ httpServer.listen(port, () => console.log(`[provider] HTTP status server listeni
 const budgeted = new Set();
 const funded = new Set();
 const open = new Set();
-let lastKnownJobCounter = 0n;
 let polling = false;
 
 async function readJobs(jobIds) {
@@ -90,15 +89,19 @@ async function pollJobs() {
 
   try {
     const counter = await client.commerce.jobCounter();
-    const newJobIds = [];
 
-    // jobId = ++jobCounter, so the current counter value is the newest job id.
-    for (let id = lastKnownJobCounter + 1n; id <= counter; id += 1n) {
-      newJobIds.push(id);
+    // Always rescan the recent job window instead of relying on an in-memory
+    // cursor. Jobs can be created between polls, and the worker must recover
+    // them after timing gaps or restarts. Scanning the latest batch is also
+    // idempotent because budgeted/funded state is tracked locally and the
+    // on-chain status is re-read before acting.
+    const recentJobIds = [];
+    const firstId = counter > BigInt(batchSize - 1) ? counter - BigInt(batchSize - 1) : 1n;
+    for (let id = firstId; id <= counter; id += 1n) {
+      recentJobIds.push(id);
     }
-    lastKnownJobCounter = counter;
 
-    for (const job of await readJobs(newJobIds)) {
+    for (const job of await readJobs(recentJobIds)) {
       if (job.provider.toLowerCase() !== jobOps.agentAddress.toLowerCase()) continue;
       if (job.status === 0) open.add(job.id.toString());
       if (job.status === 1) funded.add(job.id.toString());
@@ -183,7 +186,7 @@ async function pollJobs() {
 console.log(`[provider] address=${jobOps.agentAddress}`);
 console.log(`[provider] network=${network}`);
 console.log(`[provider] servicePrice=${servicePrice}`);
-console.log(`[provider] polling mode=jobCounter/getJob (no eth_getLogs)`);
+console.log(`[provider] polling mode=recent jobCounter/getJob (no eth_getLogs)`);
 console.log(`[provider] batchSize=${batchSize}`);
 console.log("[provider] waiting for OPEN jobs to set budget, then FUNDED jobs to execute");
 
