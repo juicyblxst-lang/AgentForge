@@ -12,10 +12,7 @@ function decodeDataUri(uri) {
 async function fetchJson(url, init = {}) {
   const response = await fetch(url, {
     ...init,
-    headers: {
-      accept: 'application/json',
-      ...(init.headers || {}),
-    },
+    headers: { accept: 'application/json', ...(init.headers || {}) },
   });
   const text = await response.text();
   let body = null;
@@ -62,6 +59,45 @@ async function resolveRegistration(agentId, chainId) {
   return { registration, agentURI, scan: body };
 }
 
+function agentIdFromRecord(record) {
+  const value = record?.agentId ?? record?.agent?.agentId ?? record?.tokenId ?? record?.agent?.tokenId;
+  return value == null ? null : String(value);
+}
+
+function walletFromRecord(record) {
+  return record?.agentWallet
+    ?? record?.agent?.agentWallet
+    ?? record?.wallet
+    ?? record?.agent?.wallet
+    ?? null;
+}
+
+function normalizeAddress(value) {
+  return typeof value === 'string' && /^0x[a-fA-F0-9]{40}$/.test(value) ? value.toLowerCase() : null;
+}
+
+async function resolveAgentIdByWallet(agentWallet, chainId) {
+  const normalizedWallet = normalizeAddress(agentWallet);
+  if (!normalizedWallet) throw new Error(`Invalid selected agent wallet: ${agentWallet}`);
+
+  const headers = {};
+  if (process.env.AGENT8004SCAN_API_KEY) headers['X-API-Key'] = process.env.AGENT8004SCAN_API_KEY;
+  const body = await fetchJson(
+    `${SCAN_BASE}/agents?chainId=${encodeURIComponent(chainId)}&owner_address=${encodeURIComponent(agentWallet)}&page=1&pageSize=100`,
+    { headers },
+  );
+
+  const records = Array.isArray(body) ? body : (body?.agents || body?.data?.agents || body?.data || []);
+  if (!Array.isArray(records)) throw new Error(`8004Scan returned an unexpected agent-list response for wallet ${agentWallet}`);
+
+  const match = records.find(record => normalizeAddress(walletFromRecord(record)) === normalizedWallet);
+  const agentId = agentIdFromRecord(match);
+  if (!agentId) {
+    throw new Error(`No ERC-8004 agent found on chain ${chainId} for selected agent wallet ${agentWallet}`);
+  }
+  return agentId;
+}
+
 export async function resolveAgentService(agentId, chainId = 97) {
   const { registration, agentURI, scan } = await resolveRegistration(agentId, chainId);
   const services = servicesFromRegistration(registration);
@@ -88,6 +124,13 @@ export async function resolveAgentService(agentId, chainId = 97) {
   };
 }
 
+export async function resolveAgentServiceForWallet(agentWallet, chainId = 97) {
+  const agentId = await resolveAgentIdByWallet(agentWallet, chainId);
+  return resolveAgentService(agentId, chainId);
+}
+
+// Backward-compatible parser for jobs created by older AgentForge builds.
+// New routing should always resolve from the on-chain job.provider wallet.
 export function extractAgentRoute(description) {
   const match = String(description || '').match(/ERC-8004 agent\s+(\d+)/i);
   if (!match) return null;
