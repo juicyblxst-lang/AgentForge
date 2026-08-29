@@ -1,9 +1,5 @@
 const AGENTS_QUERY = `query Agents($first: Int!, $skip: Int!, $where: Agent_filter) { agents(first: $first, skip: $skip, where: $where, orderBy: lastActivity, orderDirection: desc) { id agentId chainId owner agentWallet agentURI registrationFile { name description active mcpEndpoint a2aEndpoint mcpTools a2aSkills supportedTrusts x402Support } } }`;
 
-const SERVICE_REGISTRATIONS_QUERY = `query ServiceRegistrations($first: Int!, $skip: Int!, $where: AgentRegistrationFile_filter) { agentRegistrationFiles(first: $first, skip: $skip, where: $where, orderBy: createdAt, orderDirection: desc) { id agentId name description active mcpEndpoint mcpVersion mcpTools a2aEndpoint a2aVersion a2aSkills supportedTrusts x402Support agentWallet agentWalletChainId } }`;
-
-const AGENTS_BY_ID_QUERY = `query AgentsById($first: Int!, $where: Agent_filter) { agents(first: $first, where: $where, orderBy: lastActivity, orderDirection: desc) { id agentId chainId owner agentWallet agentURI registrationFile { name description active mcpEndpoint a2aEndpoint mcpTools a2aSkills supportedTrusts x402Support } } }`;
-
 async function graphRequest(endpoint, apiKey, query, variables) {
   const response = await fetch(endpoint, {
     method: 'POST',
@@ -27,58 +23,33 @@ async function discoverServiceAgents(endpoint, apiKey, chainId, requested) {
   let skip = 0;
   const maxPages = 20;
 
-  // Query the registration-file entity directly. This avoids taking an arbitrary
-  // slice of Agent entities and filtering most of them out afterwards.
+  // Use the already-proven Agent query and qualify services in application code.
+  // Do not depend on AgentRegistrationFile relationship filters: those vary by
+  // generated subgraph schema and were the source of the previous 502 path.
   for (let page = 0; page < maxPages && matches.length < requested; page += 1) {
-    const data = await graphRequest(endpoint, apiKey, SERVICE_REGISTRATIONS_QUERY, {
+    const data = await graphRequest(endpoint, apiKey, AGENTS_QUERY, {
       first: pageSize,
       skip,
-      where: { active: true },
+      where: { chainId: String(chainId) },
     });
 
-    const registrations = data.agentRegistrationFiles ?? [];
-    if (!registrations.length) break;
+    const agents = data.agents ?? [];
+    if (!agents.length) break;
 
-    for (const registration of registrations) {
-      const [registrationChainId, registrationAgentId] = String(registration.agentId || '').split(':');
-      if (String(registrationChainId) !== String(chainId)) continue;
+    for (const agent of agents) {
+      const registration = agent.registrationFile ?? {};
+      if (registration.active === false) continue;
       if (!registration.mcpEndpoint && !registration.a2aEndpoint) continue;
 
-      matches.push({
-        registration,
-        agentId: registrationAgentId,
-      });
+      matches.push(agent);
       if (matches.length >= requested) break;
     }
 
-    if (registrations.length < pageSize) break;
+    if (agents.length < pageSize) break;
     skip += pageSize;
   }
 
-  if (!matches.length) return [];
-
-  // Resolve the full on-chain Agent records so the response shape stays
-  // compatible with the existing frontend.
-  const agentIds = matches.map((match) => match.agentId).filter(Boolean);
-  const data = await graphRequest(endpoint, apiKey, AGENTS_BY_ID_QUERY, {
-    first: Math.min(Math.max(agentIds.length, 1), 100),
-    where: {
-      chainId: String(chainId),
-      agentId_in: agentIds,
-    },
-  });
-
-  const byAgentId = new Map((data.agents ?? []).map((agent) => [String(agent.agentId), agent]));
-
-  return matches
-    .map(({ registration, agentId }) => {
-      const agent = byAgentId.get(String(agentId));
-      if (!agent) return null;
-      // Prefer the freshly discovered registration data.
-      return { ...agent, registrationFile: registration };
-    })
-    .filter(Boolean)
-    .slice(0, requested);
+  return matches.slice(0, requested);
 }
 
 export default async function handler(req, res) {
