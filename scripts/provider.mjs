@@ -2,6 +2,7 @@ import { createServer } from "node:http";
 import { EVMWalletProvider, ERC8183Client, loadEnv } from "@bnbagent/sdk";
 import { ERC8183JobOps } from "@bnbagent/sdk/erc8183";
 import { LocalStorageProvider } from "@bnbagent/sdk/storage";
+import { extractAgentRoute, resolveAgentService } from "./erc8004-agent.mjs";
 
 loadEnv();
 
@@ -13,12 +14,17 @@ const network = process.env.NETWORK || "bsc-testnet";
 if (network !== "bsc-testnet") throw new Error("AgentForge provider worker currently supports bsc-testnet only");
 
 const servicePrice = BigInt(process.env.ERC8183_SERVICE_PRICE || "10000000000000000");
-const agentUrl = process.env.ERC8183_AGENT_URL;
-if (!agentUrl) throw new Error("ERC8183_AGENT_URL is required for the provider worker");
-
 const port = Number(process.env.PORT || 3000);
 const pollIntervalMs = Number(process.env.ERC8183_FUNDED_POLL_INTERVAL || 30) * 1000;
 const batchSize = Number(process.env.ERC8183_JOB_BATCH_SIZE || 50);
+
+// This is the AgentForge provider's own service URL, not an agent endpoint.
+// ERC8183_AGENT_URL remains accepted for SDK compatibility, but is never used
+// to select which marketplace agent executes a job.
+const providerServiceUrl = process.env.PROVIDER_SERVICE_URL
+  || process.env.RENDER_EXTERNAL_URL
+  || process.env.ERC8183_AGENT_URL
+  || `http://127.0.0.1:${port}`;
 
 const wallet = new EVMWalletProvider({
   password: process.env.WALLET_PASSWORD,
@@ -31,16 +37,13 @@ const jobOps = await ERC8183JobOps.create({
   network,
   storageProvider: new LocalStorageProvider(process.env.STORAGE_LOCAL_PATH || ".agent-data"),
   servicePrice,
-  agentUrl,
+  agentUrl: providerServiceUrl,
   allowUnsignedJobs: true,
 });
 
 const httpServer = createServer((req, res) => {
   if (req.method === "GET" && req.url === "/status") {
-    res.writeHead(200, {
-      "content-type": "application/json; charset=utf-8",
-      "cache-control": "no-store",
-    });
+    res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
     res.end(JSON.stringify({
       status: "ok",
       service: "agentforge-provider",
@@ -48,16 +51,14 @@ const httpServer = createServer((req, res) => {
       chainId: 97,
       agentWallet: jobOps.agentAddress,
       servicePrice: servicePrice.toString(),
-      agentUrl,
+      providerServiceUrl,
+      routing: "dynamic-erc8004",
     }));
     return;
   }
 
   if (req.method === "GET" && req.url === "/health") {
-    res.writeHead(200, {
-      "content-type": "application/json; charset=utf-8",
-      "cache-control": "no-store",
-    });
+    res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
     res.end(JSON.stringify({ status: "ok", service: "agentforge-provider" }));
     return;
   }
@@ -84,7 +85,10 @@ async function readJobs(jobIds) {
 }
 
 function extractAgentText(value) {
-  const parts = value?.result?.message?.parts || value?.result?.artifacts?.flatMap((artifact) => artifact.parts || []) || value?.message?.parts || value?.parts;
+  const parts = value?.result?.message?.parts
+    || value?.result?.artifacts?.flatMap((artifact) => artifact.parts || [])
+    || value?.message?.parts
+    || value?.parts;
   if (Array.isArray(parts)) {
     const text = parts.map((part) => part?.text ?? part?.content ?? "").filter(Boolean).join("\n");
     if (text) return text;
@@ -94,7 +98,7 @@ function extractAgentText(value) {
   return null;
 }
 
-async function executeSelectedAgent(job) {
+async function executeSelectedAgent(job, service) {
   const messageId = `${job.id.toString()}-${Date.now()}`;
   const body = {
     jsonrpc: "2.0",
@@ -112,7 +116,7 @@ async function executeSelectedAgent(job) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), Number(process.env.ERC8183_AGENT_TIMEOUT_MS || 120000));
   try {
-    const response = await fetch(agentUrl, {
+    const response = await fetch(service.endpoint, {
       method: "POST",
       headers: { "content-type": "application/json", accept: "application/json" },
       body: JSON.stringify(body),
@@ -128,8 +132,9 @@ async function executeSelectedAgent(job) {
     if (!text && !raw) throw new Error("Agent endpoint returned an empty response");
 
     return {
-      protocol: "A2A message/send",
-      endpoint: agentUrl,
+      protocol: service.protocol,
+      serviceName: service.serviceName,
+      endpoint: service.endpoint,
       response: parsed ?? raw,
       text: text ?? raw,
       receivedAt: new Date().toISOString(),
@@ -139,18 +144,26 @@ async function executeSelectedAgent(job) {
   }
 }
 
+async function executeDynamicAgent(job) {
+  const route = extractAgentRoute(job.description);
+  if (!route) throw new Error("ERC-8183 job does not contain an ERC-8004 agent id for dynamic routing");
+
+  const service = await resolveAgentService(route.agentId, route.chainId);
+  console.log(`[provider] resolved ERC-8004 #${route.agentId} -> ${service.serviceName} ${service.endpoint}`);
+
+  const agentResult = await executeSelectedAgent(job, service);
+  return { route, service, agentResult };
+}
+
 async function pollJobs() {
   if (polling) return;
   polling = true;
 
   try {
     const counter = await client.commerce.jobCounter();
-
     const recentJobIds = [];
     const firstId = counter > BigInt(batchSize - 1) ? counter - BigInt(batchSize - 1) : 1n;
-    for (let id = firstId; id <= counter; id += 1n) {
-      recentJobIds.push(id);
-    }
+    for (let id = firstId; id <= counter; id += 1n) recentJobIds.push(id);
 
     for (const job of await readJobs(recentJobIds)) {
       if (job.provider.toLowerCase() !== jobOps.agentAddress.toLowerCase()) continue;
@@ -166,18 +179,11 @@ async function pollJobs() {
       try {
         const job = await client.getJob(BigInt(key));
         if (job.provider.toLowerCase() !== jobOps.agentAddress.toLowerCase()) {
-          open.delete(key);
-          budgeted.delete(key);
-          funded.delete(key);
-          continue;
+          open.delete(key); budgeted.delete(key); funded.delete(key); continue;
         }
         if (job.status === 0) openIds.add(key);
         else if (job.status === 1) fundedIds.add(key);
-        else {
-          open.delete(key);
-          budgeted.delete(key);
-          funded.delete(key);
-        }
+        else { open.delete(key); budgeted.delete(key); funded.delete(key); }
       } catch (error) {
         console.error(`[provider] getJob(${key}) failed:`, error instanceof Error ? error.message : error);
       }
@@ -188,8 +194,7 @@ async function pollJobs() {
       try {
         const result = await client.setBudget(BigInt(key), servicePrice);
         console.log(`[provider] set budget for #${key}: ${result.txHash || result.transactionHash || "submitted"}`);
-        budgeted.add(key);
-        open.delete(key);
+        budgeted.add(key); open.delete(key);
       } catch (error) {
         console.error(`[provider] setBudget failed for #${key}:`, error instanceof Error ? error.message : error);
       }
@@ -198,35 +203,33 @@ async function pollJobs() {
     for (const key of fundedIds) {
       try {
         const job = await client.getJob(BigInt(key));
-        if (job.status !== 1) {
-          funded.delete(key);
-          continue;
-        }
+        if (job.status !== 1) { funded.delete(key); continue; }
 
         console.log(`[provider] funded job #${key}: ${job.description}`);
-
-        // Execute the selected marketplace agent first. The ERC-8183 provider
-        // remains the payer/submission identity, but the service result is now
-        // the actual response from the configured agent endpoint rather than
-        // a provider-generated placeholder.
-        const agentResult = await executeSelectedAgent(job);
-        console.log(`[provider] agent #${key} returned: ${agentResult.text.slice(0, 1000)}`);
+        const execution = await executeDynamicAgent(job);
+        console.log(`[provider] agent #${key} returned: ${execution.agentResult.text.slice(0, 1000)}`);
 
         const deliverable = JSON.stringify({
           status: "completed",
           jobId: Number(job.id),
           provider: jobOps.agentAddress,
-          agentUrl,
           description: job.description,
           executedByAgent: true,
-          agentResult,
+          routing: execution.route,
+          service: {
+            name: execution.service.serviceName,
+            endpoint: execution.service.endpoint,
+            protocol: execution.service.protocol,
+          },
+          agentResult: execution.agentResult,
           processedAt: new Date().toISOString(),
         });
 
         const result = await jobOps.submitResult(Number(job.id), deliverable, {
           agentforge: true,
-          worker: "agentforge-provider-v2",
+          worker: "agentforge-provider-v3",
           executedAgent: true,
+          routing: "erc8004-registration",
         });
 
         if (!result.success) {
@@ -249,9 +252,10 @@ async function pollJobs() {
 console.log(`[provider] address=${jobOps.agentAddress}`);
 console.log(`[provider] network=${network}`);
 console.log(`[provider] servicePrice=${servicePrice}`);
+console.log(`[provider] routing=dynamic ERC-8004 registration via 8004scan`);
 console.log(`[provider] polling mode=recent jobCounter/getJob (no eth_getLogs)`);
 console.log(`[provider] batchSize=${batchSize}`);
-console.log(`[provider] waiting for OPEN jobs to set budget, then FUNDED jobs to execute selected agent and submit its result`);
+console.log(`[provider] waiting for OPEN jobs to set budget, then FUNDED jobs to resolve and execute the selected ERC-8004 agent`);
 
 await pollJobs();
 setInterval(() => void pollJobs(), pollIntervalMs);
