@@ -19,11 +19,9 @@ const pollIntervalMs = Number(process.env.ERC8183_FUNDED_POLL_INTERVAL || 30) * 
 const batchSize = Number(process.env.ERC8183_JOB_BATCH_SIZE || 50);
 
 // This is the AgentForge provider's own service URL, not an agent endpoint.
-// ERC8183_AGENT_URL remains accepted for SDK compatibility, but is never used
-// to select which marketplace agent executes a job.
+// The selected marketplace agent is resolved dynamically from ERC-8004.
 const providerServiceUrl = process.env.PROVIDER_SERVICE_URL
   || process.env.RENDER_EXTERNAL_URL
-  || process.env.ERC8183_AGENT_URL
   || `http://127.0.0.1:${port}`;
 
 const wallet = new EVMWalletProvider({
