@@ -78,7 +78,7 @@ function extractAgentText(value) {
 function classifyExecutionError(error) {
   const message = error instanceof Error ? error.message : String(error);
   const status = message.match(/HTTP\s+(\d{3})/i)?.[1];
-  if (status && /^4\d\d$/.test(status)) return { terminal: true, message };
+  if ((status && /^4\d\d$/.test(status)) || /no resolvable registration file/i.test(message)) return { terminal: true, message };
   return { terminal: false, message };
 }
 
@@ -361,9 +361,15 @@ async function pollJobs() {
       try {
         const job = await client.getJob(BigInt(key));
         if (job.status !== 1) { funded.delete(key); continue; }
-        await processFundedJob(job);
+        // Do not await agent execution here. A slow/hung/failed agent must never
+        // block the poll loop from discovering and budgeting newly-created jobs.
+        // The per-job executing set prevents duplicate execution while the promise
+        // is in flight, and the retry state handles transient failures.
+        void processFundedJob(job).catch((error) => {
+          console.error(`[provider] funded job #${key} execution cycle ended:`, error instanceof Error ? error.message : error);
+        });
       } catch (error) {
-        console.error(`[provider] funded job #${key} execution cycle ended:`, error instanceof Error ? error.message : error);
+        console.error(`[provider] funded job #${key} dispatch failed:`, error instanceof Error ? error.message : error);
       }
     }
   } finally {
@@ -377,5 +383,6 @@ console.log(`[provider] servicePrice=${servicePrice}`);
 console.log(`[provider] execution endpoint=${executionEndpoint}`);
 console.log(`[provider] routing=dynamic ERC-8004 registration via 8004scan`);
 console.log(`[provider] retry policy=max ${maxRetries}, exponential backoff`);
+console.log(`[provider] execution is non-blocking; budget polling remains independent of agent latency`);
 await pollJobs();
 setInterval(() => void pollJobs(), pollIntervalMs);
