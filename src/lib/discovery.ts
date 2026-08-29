@@ -37,13 +37,14 @@ function classifyAgent(name: string, description: string | undefined, capabiliti
 }
 
 export async function discoverBscAgents(first = 100, skip = 0): Promise<MarketplaceAgent[]> {
-  // Query the stable Agent endpoint with a BSC filter. Keep discovery simple here;
-  // the API owns source-specific qualification so a source query failure cannot
-  // take down the marketplace through an extra services-only Graph query.
+  // The API qualifies the BSC registrations for a live A2A/MCP service before
+  // returning them. This keeps the marketplace focused on agents that advertise
+  // an actual service while leaving ERC-8183 execution completely separate.
   const params = new URLSearchParams({
     first: String(Math.min(Math.max(first, 1), 100)),
     skip: String(Math.max(skip, 0)),
     chainId: '97',
+    servicesOnly: 'true',
   });
   const response = await fetch(`/api/agents?${params.toString()}`);
   if (!response.ok) throw new Error(`Agent discovery failed (${response.status})`);
