@@ -5,11 +5,30 @@ export type MarketplaceAgent = {
   capabilitiesVerified?: boolean; active?: boolean;
 };
 
+// These are the four first-class BNB Agent Studio marketplace categories.
+// Keep classification evidence-driven: use the agent's name, description and
+// declared capabilities, without inventing a category when there is no signal.
 const categoryKeywords: Record<string, string[]> = {
-  Research: ['research', 'search', 'query', 'knowledge', 'analysis', 'analyze', 'data', 'information', 'summarize', 'document'],
-  Trading: ['trading', 'trade', 'trader', 'market', 'price', 'swap', 'order', 'portfolio', 'arbitrage', 'signal'],
-  DeFi: ['defi', 'lending', 'borrowing', 'staking', 'yield', 'liquidity', 'dex', 'amm', 'bridge', 'finance', 'swap'],
-  Commerce: ['commerce', 'payment', 'payments', 'purchase', 'shopping', 'merchant', 'checkout', 'invoice', 'order', 'marketplace']
+  'Rebalancing': [
+    'rebalanc', 'range management', 'lp range', 'liquidity range',
+    'position management', 'position rebalance', 'concentrated liquidity',
+    'liquidity management', 'auto-compound'
+  ],
+  'Grid Trading': [
+    'grid trading', 'grid trader', 'grid bot', 'grid strategy',
+    'grid order', 'grid orders', 'automated grid', 'range orders'
+  ],
+  'Yield Optimisation': [
+    'yield optim', 'yield optimizer', 'yield optimisation', 'yield optimization',
+    'apr', 'apy', 'yield', 'staking', 'liquidity mining', 'vault',
+    'highest yield', 'best yield', 'yield routing'
+  ],
+  'Health Factor Monitoring': [
+    'health factor', 'liquidation', 'liquidation risk', 'liquidation protection',
+    'lending position', 'lending positions', 'borrow position', 'borrow positions',
+    'collateral health', 'collateral ratio', 'venus lending', 'venus health',
+    'borrow health', 'loan health'
+  ],
 };
 
 function collectCapabilities(rf: any): string[] {
