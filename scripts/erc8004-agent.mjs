@@ -1,22 +1,37 @@
 const SCAN_BASE = 'https://api.8004scan.io/api/v1';
 
+function debug(label, payload) {
+  console.log(`[erc8004-debug] ${label} ${JSON.stringify(payload).slice(0, 50000)}`);
+}
+
 function decodeDataUri(uri) {
   if (!uri?.startsWith('data:application/json;base64,')) return null;
   try {
-    return JSON.parse(Buffer.from(uri.slice('data:application/json;base64,'.length), 'base64').toString('utf8'));
-  } catch {
+    const decoded = JSON.parse(Buffer.from(uri.slice('data:application/json;base64,'.length), 'base64').toString('utf8'));
+    debug('DATA_URI_DECODE', { decoded });
+    return decoded;
+  } catch (error) {
+    debug('DATA_URI_DECODE_FAILED', { error: String(error) });
     return null;
   }
 }
 
 async function fetchJson(url, init = {}) {
-  const response = await fetch(url, {
-    ...init,
-    headers: { accept: 'application/json', ...(init.headers || {}) },
-  });
+  debug('FETCH_START', { url, method: init.method || 'GET' });
+  let response;
+  try {
+    response = await fetch(url, {
+      ...init,
+      headers: { accept: 'application/json', ...(init.headers || {}) },
+    });
+  } catch (error) {
+    debug('FETCH_NETWORK_ERROR', { url, error: String(error) });
+    throw error;
+  }
   const text = await response.text();
   let body = null;
   try { body = text ? JSON.parse(text) : null; } catch { body = null; }
+  debug('FETCH_RESULT', { url, status: response.status, ok: response.ok, body: body ?? text });
   if (!response.ok) throw new Error(`8004Scan request failed (${response.status}): ${text.slice(0, 300)}`);
   return body;
 }
@@ -39,23 +54,37 @@ function servicesFromRegistration(registration) {
 }
 
 async function resolveRegistration(agentId, chainId) {
+  debug('RESOLVE_START', { agentId: String(agentId), chainId: Number(chainId) });
   const headers = {};
   if (process.env.AGENT8004SCAN_API_KEY) headers['X-API-Key'] = process.env.AGENT8004SCAN_API_KEY;
-  const body = await fetchJson(`${SCAN_BASE}/agents/${encodeURIComponent(chainId)}/${encodeURIComponent(agentId)}`, { headers });
+  const scanUrl = `${SCAN_BASE}/agents/${encodeURIComponent(chainId)}/${encodeURIComponent(agentId)}`;
+  const body = await fetchJson(scanUrl, { headers });
+  debug('SCAN_RESPONSE_FULL', { agentId: String(agentId), chainId: Number(chainId), scanUrl, response: body });
+
   let registration = registrationFromScan(body);
   const agentURI = agentUriFromScan(body);
+  debug('EXTRACTED_REGISTRATION_FIELDS', { agentId: String(agentId), chainId: Number(chainId), registrationFile: registration, agentURI });
 
   if (!registration && agentURI) {
+    debug('REGISTRATION_RESOLUTION_DECISION', { decision: 'registrationFile_missing_use_agentURI', agentURI });
     registration = decodeDataUri(agentURI);
     if (!registration) {
       const uri = agentURI.startsWith('ipfs://')
         ? `https://ipfs.io/ipfs/${agentURI.slice('ipfs://'.length)}`
         : agentURI;
+      debug('REGISTRATION_FETCH_URL', { agentId: String(agentId), agentURI, finalFetchUrl: uri });
       registration = await fetchJson(uri);
+      debug('REGISTRATION_FETCH_PARSED', { agentId: String(agentId), finalFetchUrl: uri, registration });
     }
+  } else if (!registration) {
+    debug('REGISTRATION_RESOLUTION_DECISION', { decision: 'FAIL_NO_REGISTRATION_OR_AGENT_URI', agentId: String(agentId), chainId: Number(chainId), registrationFile: null, agentURI: null });
   }
 
-  if (!registration) throw new Error(`ERC-8004 agent ${agentId} has no resolvable registration file`);
+  if (!registration) {
+    debug('UNRESOLVABLE_REGISTRATION', { agentId: String(agentId), chainId: Number(chainId), scanResponse: body, registrationFile: registrationFromScan(body), agentURI, decision: 'throw_no_resolvable_registration_file' });
+    throw new Error(`ERC-8004 agent ${agentId} has no resolvable registration file`);
+  }
+  debug('REGISTRATION_SUCCESS', { agentId: String(agentId), chainId: Number(chainId), agentURI, registration });
   return { registration, agentURI, scan: body };
 }
 
@@ -65,11 +94,7 @@ function agentIdFromRecord(record) {
 }
 
 function walletFromRecord(record) {
-  return record?.agentWallet
-    ?? record?.agent?.agentWallet
-    ?? record?.wallet
-    ?? record?.agent?.wallet
-    ?? null;
+  return record?.agentWallet ?? record?.agent?.agentWallet ?? record?.wallet ?? record?.agent?.wallet ?? null;
 }
 
 function normalizeAddress(value) {
@@ -79,49 +104,32 @@ function normalizeAddress(value) {
 async function resolveAgentIdByWallet(agentWallet, chainId) {
   const normalizedWallet = normalizeAddress(agentWallet);
   if (!normalizedWallet) throw new Error(`Invalid selected agent wallet: ${agentWallet}`);
-
   const headers = {};
   if (process.env.AGENT8004SCAN_API_KEY) headers['X-API-Key'] = process.env.AGENT8004SCAN_API_KEY;
-  const body = await fetchJson(
-    `${SCAN_BASE}/agents?chainId=${encodeURIComponent(chainId)}&owner_address=${encodeURIComponent(agentWallet)}&page=1&pageSize=100`,
-    { headers },
-  );
-
+  const listUrl = `${SCAN_BASE}/agents?chainId=${encodeURIComponent(chainId)}&owner_address=${encodeURIComponent(agentWallet)}&page=1&pageSize=100`;
+  const body = await fetchJson(listUrl, { headers });
+  debug('WALLET_AGENT_LIST_RESPONSE', { agentWallet, chainId: Number(chainId), listUrl, response: body });
   const records = Array.isArray(body) ? body : (body?.agents || body?.data?.agents || body?.data || []);
   if (!Array.isArray(records)) throw new Error(`8004Scan returned an unexpected agent-list response for wallet ${agentWallet}`);
-
   const match = records.find(record => normalizeAddress(walletFromRecord(record)) === normalizedWallet);
   const agentId = agentIdFromRecord(match);
-  if (!agentId) {
-    throw new Error(`No ERC-8004 agent found on chain ${chainId} for selected agent wallet ${agentWallet}`);
-  }
+  debug('WALLET_AGENT_RESOLUTION', { agentWallet, chainId: Number(chainId), matchedRecord: match, agentId });
+  if (!agentId) throw new Error(`No ERC-8004 agent found on chain ${chainId} for selected agent wallet ${agentWallet}`);
   return agentId;
 }
 
 export async function resolveAgentService(agentId, chainId = 97) {
   const { registration, agentURI, scan } = await resolveRegistration(agentId, chainId);
   const services = servicesFromRegistration(registration);
-
+  debug('SERVICE_EXTRACTION', { agentId: String(agentId), services, registration });
   const preferred = services.find(service => /^a2a$/i.test(service.name || ''))
     || services.find(service => /a2a|agent.?card/i.test(service.name || ''))
     || services.find(service => /erc.?8183/i.test(service.name || ''))
     || services.find(service => /^mcp$/i.test(service.name || ''))
     || services.find(service => /^https?:\/\//i.test(service.endpoint));
-
+  debug('SERVICE_SELECTION', { agentId: String(agentId), selected: preferred || null });
   if (!preferred) throw new Error(`ERC-8004 agent ${agentId} has no executable HTTP service endpoint`);
-
-  return {
-    agentId: String(agentId),
-    chainId: Number(chainId),
-    agentURI,
-    name: registration.name,
-    serviceName: preferred.name || 'custom',
-    endpoint: preferred.endpoint,
-    version: preferred.version,
-    protocol: /^a2a$/i.test(preferred.name || '') || /a2a|agent.?card/i.test(preferred.name || '') ? 'a2a' : 'custom',
-    registration,
-    scan,
-  };
+  return { agentId: String(agentId), chainId: Number(chainId), agentURI, name: registration.name, serviceName: preferred.name || 'custom', endpoint: preferred.endpoint, version: preferred.version, protocol: /^a2a$/i.test(preferred.name || '') || /a2a|agent.?card/i.test(preferred.name || '') ? 'a2a' : 'custom', registration, scan };
 }
 
 export async function resolveAgentServiceForWallet(agentWallet, chainId = 97) {
@@ -129,8 +137,6 @@ export async function resolveAgentServiceForWallet(agentWallet, chainId = 97) {
   return resolveAgentService(agentId, chainId);
 }
 
-// Backward-compatible parser for jobs created by older AgentForge builds.
-// New routing should always resolve from the on-chain job.provider wallet.
 export function extractAgentRoute(description) {
   const match = String(description || '').match(/ERC-8004 agent\s+(\d+)/i);
   if (!match) return null;
