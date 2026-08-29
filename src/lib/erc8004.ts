@@ -47,7 +47,7 @@ export async function verifyAgentCapabilities(identity: AgentIdentity): Promise<
     const data = await response.json();
     return {
       verified: Boolean(data?.verified),
-      active: data?.active !== false,
+      active: data?.active === undefined ? true : Boolean(data.active),
       registrationBound: Boolean(data?.registrationBound),
       capabilities: Array.isArray(data?.capabilities)
         ? data.capabilities.filter((x: unknown): x is string => typeof x === 'string' && x.trim())
