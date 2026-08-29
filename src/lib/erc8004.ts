@@ -46,6 +46,28 @@ async function readRegistration(uri: string): Promise<any> {
   return response.json();
 }
 
+function strings(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((x): x is string => typeof x === 'string' && x.trim().length > 0) : [];
+}
+
+async function readA2ACapabilities(endpoint: unknown): Promise<string[]> {
+  if (typeof endpoint !== 'string' || !endpoint || endpoint.includes('localhost') || endpoint.includes('127.0.0.1')) return [];
+  try {
+    const response = await fetch(endpoint, { headers: { Accept: 'application/json' } });
+    if (!response.ok) return [];
+    const card = await response.json();
+    const skills = Array.isArray(card?.skills) ? card.skills : [];
+    return skills.flatMap((skill: any) => {
+      const name = typeof skill?.name === 'string' ? skill.name.trim() : '';
+      const id = typeof skill?.id === 'string' ? skill.id.trim() : '';
+      const tags = strings(skill?.tags);
+      return [name || id, ...tags].filter(Boolean);
+    });
+  } catch {
+    return [];
+  }
+}
+
 export async function verifyAgentCapabilities(identity: AgentIdentity): Promise<CapabilityVerification> {
   const registration = await readRegistration(identity.agentURI);
   const expectedRegistration = `eip155:${identity.chainId}:${CONTRACTS.identityRegistry.toLowerCase()}`;
@@ -56,19 +78,31 @@ export async function verifyAgentCapabilities(identity: AgentIdentity): Promise<
   );
 
   const services = Array.isArray(registration?.services) ? registration.services : [];
-  const capabilities = services.flatMap((service: any) => {
+  const serviceCapabilities = services.flatMap((service: any) => {
     const values: string[] = [];
-    if (Array.isArray(service?.skills)) values.push(...service.skills.filter((x: unknown): x is string => typeof x === 'string'));
-    if (Array.isArray(service?.tools)) values.push(...service.tools.filter((x: unknown): x is string => typeof x === 'string'));
-    if (service?.name === 'MCP' && service?.endpoint) values.push(`MCP:${service.endpoint}`);
-    if (service?.name === 'A2A' && service?.endpoint) values.push(`A2A:${service.endpoint}`);
+    const type = String(service?.name ?? service?.type ?? '').toUpperCase();
+    values.push(...strings(service?.skills));
+    values.push(...strings(service?.tools));
+    values.push(...strings(service?.a2aSkills));
+    values.push(...strings(service?.mcpTools));
+    if (type === 'A2A') values.push(...(service?.endpoint ? [`A2A:${service.endpoint}`] : []));
+    if (type === 'MCP') values.push(...(service?.endpoint ? [`MCP:${service.endpoint}`] : []));
     return values;
   });
 
   const fallbackCapabilities = [
-    ...(Array.isArray(registration?.capabilities) ? registration.capabilities : []),
-  ].filter((x: unknown): x is string => typeof x === 'string');
-  const uniqueCapabilities = [...new Set([...capabilities, ...fallbackCapabilities])];
+    ...strings(registration?.capabilities),
+    ...strings(registration?.a2aSkills),
+    ...strings(registration?.mcpTools),
+  ];
+
+  const a2aEndpoints = services
+    .filter((service: any) => String(service?.name ?? service?.type ?? '').toUpperCase() === 'A2A')
+    .map((service: any) => service?.endpoint)
+    .filter((endpoint: unknown): endpoint is string => typeof endpoint === 'string');
+
+  const a2aCardCapabilities = (await Promise.all(a2aEndpoints.map(readA2ACapabilities))).flat();
+  const uniqueCapabilities = [...new Set([...serviceCapabilities, ...fallbackCapabilities, ...a2aCardCapabilities])];
   const active = registration?.active !== false;
   const verified = registrationBound && active && uniqueCapabilities.length > 0;
 
@@ -83,6 +117,6 @@ export async function verifyAgentCapabilities(identity: AgentIdentity): Promise<
         ? 'Registration file is not cryptographically bound to this ERC-8004 agent.'
         : !active
           ? 'Agent registration is marked inactive.'
-          : 'No declared capabilities were found in the registration file.',
+          : 'No declared capabilities were found in the registration file or its public A2A Agent Card.',
   };
 }
