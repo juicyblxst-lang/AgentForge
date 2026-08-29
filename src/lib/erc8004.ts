@@ -53,8 +53,8 @@ function strings(value: unknown): string[] {
 async function readA2ACapabilities(endpoint: unknown): Promise<string[]> {
   if (typeof endpoint !== 'string' || !endpoint || endpoint.includes('localhost') || endpoint.includes('127.0.0.1')) return [];
   try {
-    // Resolve through our server so arbitrary agent origins do not need CORS
-    // permission from AgentForge. The server also validates the Agent Card shape.
+    // The Agent Card is fetched by AgentForge's server-side resolver so the
+    // third-party agent does not need to enable browser CORS for our origin.
     const response = await fetch(`/api/agent-card?endpoint=${encodeURIComponent(endpoint)}`);
     if (!response.ok) return [];
     const data = await response.json();
@@ -82,13 +82,10 @@ export async function verifyAgentCapabilities(identity: AgentIdentity): Promise<
   const services = Array.isArray(registration?.services) ? registration.services : [];
   const serviceCapabilities = services.flatMap((service: any) => {
     const values: string[] = [];
-    const type = String(service?.name ?? service?.type ?? '').toUpperCase();
     values.push(...strings(service?.skills));
     values.push(...strings(service?.tools));
     values.push(...strings(service?.a2aSkills));
     values.push(...strings(service?.mcpTools));
-    if (type === 'A2A') values.push(...(service?.endpoint ? [`A2A:${service.endpoint}`] : []));
-    if (type === 'MCP') values.push(...(service?.endpoint ? [`MCP:${service.endpoint}`] : []));
     return values;
   });
 
