@@ -2,7 +2,7 @@ import { createServer } from "node:http";
 import { EVMWalletProvider, ERC8183Client, loadEnv } from "@bnbagent/sdk";
 import { ERC8183JobOps } from "@bnbagent/sdk/erc8183";
 import { LocalStorageProvider } from "@bnbagent/sdk/storage";
-import { extractAgentRoute, resolveAgentService, resolveAgentServiceForWallet } from "./erc8004-agent.mjs";
+import { extractAgentRoute, resolveAgentService } from "./erc8004-agent.mjs";
 
 loadEnv();
 
@@ -18,8 +18,6 @@ const port = Number(process.env.PORT || 3000);
 const pollIntervalMs = Number(process.env.ERC8183_FUNDED_POLL_INTERVAL || 30) * 1000;
 const batchSize = Number(process.env.ERC8183_JOB_BATCH_SIZE || 50);
 
-// This is the AgentForge provider's own service URL, not an agent endpoint.
-// The selected marketplace agent is resolved dynamically from ERC-8004.
 const providerServiceUrl = process.env.PROVIDER_SERVICE_URL
   || process.env.RENDER_EXTERNAL_URL
   || `http://127.0.0.1:${port}`;
@@ -42,25 +40,14 @@ const jobOps = await ERC8183JobOps.create({
 const httpServer = createServer((req, res) => {
   if (req.method === "GET" && req.url === "/status") {
     res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
-    res.end(JSON.stringify({
-      status: "ok",
-      service: "agentforge-provider",
-      network,
-      chainId: 97,
-      agentWallet: jobOps.agentAddress,
-      servicePrice: servicePrice.toString(),
-      providerServiceUrl,
-      routing: "dynamic-erc8004",
-    }));
+    res.end(JSON.stringify({ status: "ok", service: "agentforge-provider", network, chainId: 97, agentWallet: jobOps.agentAddress, servicePrice: servicePrice.toString(), providerServiceUrl, routing: "dynamic-erc8004" }));
     return;
   }
-
   if (req.method === "GET" && req.url === "/health") {
     res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
     res.end(JSON.stringify({ status: "ok", service: "agentforge-provider" }));
     return;
   }
-
   res.writeHead(404, { "content-type": "application/json; charset=utf-8" });
   res.end(JSON.stringify({ error: "Not found" }));
 });
@@ -98,18 +85,37 @@ function extractAgentText(value) {
 
 async function executeSelectedAgent(job, service) {
   const messageId = `${job.id.toString()}-${Date.now()}`;
-  const body = {
-    jsonrpc: "2.0",
-    id: messageId,
-    method: "message/send",
-    params: {
-      message: {
-        messageId,
-        role: "user",
-        parts: [{ kind: "text", text: job.description }],
-      },
-    },
-  };
+  const isA2A = service.protocol === "a2a";
+  const isERC8183Custom = service.protocol === "custom" && /erc.?8183/i.test(`${service.serviceName} ${service.endpoint}`);
+
+  const body = isA2A
+    ? {
+        jsonrpc: "2.0",
+        id: messageId,
+        method: "message/send",
+        params: {
+          message: {
+            messageId,
+            role: "user",
+            parts: [{ kind: "text", text: job.description }],
+          },
+        },
+      }
+    : isERC8183Custom
+      ? {
+          jobId: Number(job.id),
+          agentId: Number(service.agentId),
+          chainId: Number(service.chainId),
+          task: job.description,
+        }
+      : {
+          jobId: Number(job.id),
+          agentId: Number(service.agentId),
+          chainId: Number(service.chainId),
+          task: job.description,
+        };
+
+  console.log(`[provider] invoking ${service.protocol} service ${service.serviceName} at ${service.endpoint}`);
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), Number(process.env.ERC8183_AGENT_TIMEOUT_MS || 120000));
@@ -123,7 +129,9 @@ async function executeSelectedAgent(job, service) {
     const raw = await response.text();
     let parsed = null;
     try { parsed = raw ? JSON.parse(raw) : null; } catch { /* keep raw text */ }
-    if (!response.ok) throw new Error(`Agent endpoint returned HTTP ${response.status}: ${raw.slice(0, 500)}`);
+    if (!response.ok) {
+      throw new Error(`Agent service ${service.serviceName} returned HTTP ${response.status}: ${raw.slice(0, 500)}`);
+    }
     if (parsed?.error) throw new Error(`Agent endpoint returned JSON-RPC error: ${JSON.stringify(parsed.error)}`);
 
     const text = extractAgentText(parsed);
@@ -133,6 +141,7 @@ async function executeSelectedAgent(job, service) {
       protocol: service.protocol,
       serviceName: service.serviceName,
       endpoint: service.endpoint,
+      request: body,
       response: parsed ?? raw,
       text: text ?? raw,
       receivedAt: new Date().toISOString(),
@@ -143,30 +152,22 @@ async function executeSelectedAgent(job, service) {
 }
 
 async function executeDynamicAgent(job) {
-  // The ERC-8183 job.provider is the selected marketplace agent wallet.
-  // Resolve the agent identity from that wallet through 8004Scan instead of
-  // requiring an endpoint or agent ID environment variable for every agent.
-  try {
-    const service = await resolveAgentServiceForWallet(job.provider, 97);
-    console.log(`[provider] resolved selected wallet ${job.provider} -> ERC-8004 #${service.agentId} ${service.serviceName} ${service.endpoint}`);
-    const agentResult = await executeSelectedAgent(job, service);
-    return { route: { agentId: service.agentId, chainId: 97, source: "job.provider" }, service, agentResult };
-  } catch (walletError) {
-    // Backward compatibility for jobs created by the previous experimental
-    // branch. New jobs should never need this fallback.
-    const route = extractAgentRoute(job.description);
-    if (!route) throw walletError;
-    const service = await resolveAgentService(route.agentId, route.chainId);
-    console.log(`[provider] legacy route fallback ERC-8004 #${route.agentId} -> ${service.serviceName} ${service.endpoint}`);
-    const agentResult = await executeSelectedAgent(job, service);
-    return { route: { ...route, source: "legacy-description" }, service, agentResult };
-  }
+  // ERC-8183's provider field is AgentForge's execution provider, not the
+  // selected marketplace agent. The selected ERC-8004 identity therefore
+  // travels in the job description until ERC-8183 exposes a dedicated
+  // structured metadata field. Resolve that identity from the job metadata.
+  const route = extractAgentRoute(job.description);
+  if (!route) throw new Error(`No ERC-8004 agent route found in job #${job.id}`);
+
+  const service = await resolveAgentService(route.agentId, route.chainId);
+  console.log(`[provider] resolved ERC-8004 #${route.agentId} ${service.serviceName} ${service.endpoint}`);
+  const agentResult = await executeSelectedAgent(job, service);
+  return { route: { ...route, source: "job-description-metadata" }, service, agentResult };
 }
 
 async function pollJobs() {
   if (polling) return;
   polling = true;
-
   try {
     const counter = await client.commerce.jobCounter();
     const recentJobIds = [];
@@ -224,11 +225,7 @@ async function pollJobs() {
           description: job.description,
           executedByAgent: true,
           routing: execution.route,
-          service: {
-            name: execution.service.serviceName,
-            endpoint: execution.service.endpoint,
-            protocol: execution.service.protocol,
-          },
+          service: { name: execution.service.serviceName, endpoint: execution.service.endpoint, protocol: execution.service.protocol },
           agentResult: execution.agentResult,
           processedAt: new Date().toISOString(),
         });
