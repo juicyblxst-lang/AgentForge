@@ -1,7 +1,8 @@
 export type MarketplaceAgent = {
   id: string; agentId: string; chainId: number; name: string; description?: string;
   owner?: string; agentWallet?: string; agentURI?: string; capabilities: string[];
-  categories: string[]; mcpEndpoint?: string; a2aEndpoint?: string; active?: boolean;
+  categories: string[]; mcpEndpoint?: string; a2aEndpoint?: string; agentCardUrl?: string | null;
+  capabilitiesVerified?: boolean; active?: boolean;
 };
 
 const categoryKeywords: Record<string, string[]> = {
@@ -36,10 +37,19 @@ function classifyAgent(name: string, description: string | undefined, capabiliti
     .map(([category]) => category);
 }
 
+async function resolveAgentCard(endpoint?: string) {
+  if (!endpoint || endpoint.includes('localhost') || endpoint.includes('127.0.0.1')) return null;
+  try {
+    const response = await fetch(`/api/agent-card?endpoint=${encodeURIComponent(endpoint)}`);
+    if (!response.ok) return null;
+    const data = await response.json();
+    return data?.agentCardUrl ? data : null;
+  } catch {
+    return null;
+  }
+}
+
 export async function discoverBscAgents(first = 100, skip = 0): Promise<MarketplaceAgent[]> {
-  // The API qualifies the BSC registrations for a live A2A/MCP service before
-  // returning them. This keeps the marketplace focused on agents that advertise
-  // an actual service while leaving ERC-8183 execution completely separate.
   const params = new URLSearchParams({
     first: String(Math.min(Math.max(first, 1), 100)),
     skip: String(Math.max(skip, 0)),
@@ -50,24 +60,17 @@ export async function discoverBscAgents(first = 100, skip = 0): Promise<Marketpl
   if (!response.ok) throw new Error(`Agent discovery failed (${response.status})`);
   const data = await response.json() as { agents?: any[]; error?: string };
   if (data.error) throw new Error(data.error);
-  return (data.agents ?? []).filter(a => Number(a.chainId) === 97).map(a => {
+  return Promise.all((data.agents ?? []).filter(a => Number(a.chainId) === 97).map(async a => {
     const rf = a.registrationFile ?? {};
-    const capabilities = collectCapabilities(rf);
+    const card = await resolveAgentCard(rf.a2aEndpoint);
+    const capabilities = collectCapabilities({ ...rf, a2aSkills: card?.skills ?? rf.a2aSkills });
     const name = rf.name || `Agent ${a.agentId}`;
     return {
-      id: String(a.id),
-      agentId: String(a.agentId),
-      chainId: 97,
-      name,
-      description: rf.description,
-      owner: a.owner,
-      agentWallet: a.agentWallet,
-      agentURI: a.agentURI,
-      capabilities,
-      categories: classifyAgent(name, rf.description, capabilities),
-      mcpEndpoint: rf.mcpEndpoint,
-      a2aEndpoint: rf.a2aEndpoint,
-      active: rf.active
+      id: String(a.id), agentId: String(a.agentId), chainId: 97, name,
+      description: rf.description, owner: a.owner, agentWallet: a.agentWallet, agentURI: a.agentURI,
+      capabilities, categories: classifyAgent(name, rf.description, capabilities),
+      mcpEndpoint: rf.mcpEndpoint, a2aEndpoint: rf.a2aEndpoint,
+      agentCardUrl: card?.agentCardUrl ?? null, capabilitiesVerified: !!card, active: rf.active
     };
-  });
+  }));
 }
