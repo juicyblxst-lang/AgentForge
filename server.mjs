@@ -1,7 +1,6 @@
 import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { extname, join, normalize } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { createClient } from '@supabase/supabase-js';
 
 const root = fileURLToPath(new URL('.', import.meta.url));
@@ -16,9 +15,72 @@ const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
 const supabase = supabaseUrl && supabaseServiceRoleKey ? createClient(supabaseUrl, supabaseServiceRoleKey, { auth: { persistSession: false, autoRefreshToken: false } }) : null;
 const query = `query Agents($first: Int!, $skip: Int!) { agents(first: $first, skip: $skip, orderBy: lastActivity, orderDirection: desc) { id agentId chainId owner agentWallet agentURI registrationFile { name description active mcpEndpoint a2aEndpoint mcpTools a2aSkills supportedTrusts x402Support } } }`;
 const STATUSES = new Set(['CREATED','REGISTERED','FUNDED','SUBMITTED','SETTLED','VERIFIED','FAILED']);
+const agentCardCache = new Map();
+const AGENT_CARD_TTL_MS = 6 * 60 * 60 * 1000;
 
 function json(res, status, body) { res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' }); res.end(JSON.stringify(body)); }
 async function readBody(req) { let body = ''; for await (const chunk of req) body += chunk; if (body.length > 100_000) throw new Error('Request body too large'); return JSON.parse(body || '{}'); }
+
+function isPublicHttpUrl(value) {
+  try {
+    const url = new URL(value);
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return false;
+    const host = url.hostname.toLowerCase();
+    return host !== 'localhost' && host !== '127.0.0.1' && host !== '::1' && !host.startsWith('169.254.') && !host.startsWith('10.') && !host.startsWith('192.168.') && !/^172\.(1[6-9]|2\d|3[0-1])\./.test(host);
+  } catch {
+    return false;
+  }
+}
+
+async function fetchAgentCard(a2aEndpoint) {
+  if (!isPublicHttpUrl(a2aEndpoint)) return null;
+  const base = a2aEndpoint.replace(/\/+$/, '');
+  const candidates = [`${base}/.well-known/agent-card.json`, `${base}/.well-known/agent.json`];
+
+  for (const cardUrl of candidates) {
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 5000);
+      let response;
+      try {
+        response = await fetch(cardUrl, { signal: controller.signal, headers: { Accept: 'application/json' } });
+      } finally {
+        clearTimeout(timeout);
+      }
+      if (!response.ok) continue;
+      const card = await response.json();
+      if (!card || typeof card !== 'object' || !Array.isArray(card.skills)) continue;
+
+      return {
+        source: 'a2a_agent_card',
+        agentCardUrl: cardUrl,
+        skills: card.skills,
+        capabilities: card.capabilities ?? {},
+        url: card.url ?? a2aEndpoint,
+        verified: true,
+        fetchedAt: new Date().toISOString(),
+      };
+    } catch {
+      // Try the legacy Agent Card location before reporting no capabilities.
+    }
+  }
+  return null;
+}
+
+async function agentCard(req, res) {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const a2aEndpoint = (url.searchParams.get('endpoint') || '').trim();
+  if (!a2aEndpoint) return json(res, 400, { error: 'missing endpoint' });
+  if (!isPublicHttpUrl(a2aEndpoint)) return json(res, 400, { error: 'invalid public HTTP endpoint' });
+
+  const cached = agentCardCache.get(a2aEndpoint);
+  if (cached && cached.expires > Date.now()) return json(res, 200, cached.data);
+
+  const result = await fetchAgentCard(a2aEndpoint);
+  const payload = result ?? { source: 'none', agentCardUrl: null, skills: [], capabilities: {}, verified: false };
+  agentCardCache.set(a2aEndpoint, { data: payload, expires: Date.now() + AGENT_CARD_TTL_MS });
+  return json(res, 200, payload);
+}
 
 async function agents(req, res) {
   if (!apiKey && !process.env.AGENT0_GRAPH_URL) return json(res, 503, { error: 'AGENT0_GRAPH_API_KEY is not configured on the server' });
@@ -52,4 +114,4 @@ async function executions(req, res) {
 }
 
 const mime = { '.html':'text/html; charset=utf-8', '.js':'text/javascript; charset=utf-8', '.css':'text/css; charset=utf-8', '.json':'application/json; charset=utf-8', '.svg':'image/svg+xml', '.png':'image/png', '.ico':'image/x-icon' };
-createServer(async (req, res) => { try { if (req.url?.startsWith('/api/agents')) return agents(req, res); if (req.url?.startsWith('/api/provider')) return provider(req, res); if (req.url?.startsWith('/api/executions')) return executions(req, res); if (req.method !== 'GET' && req.method !== 'HEAD') return json(res, 405, { error: 'Method not allowed' }); const pathname = new URL(req.url || '/', `http://${req.headers.host}`).pathname; const safe = normalize(pathname).replace(/^([.][.][/\\])+/, ''); const candidate = join(dist, safe === '/' ? 'index.html' : safe); let file; try { file = await readFile(candidate); } catch { file = await readFile(join(dist, 'index.html')); } res.writeHead(200, { 'content-type': mime[extname(candidate)] || 'application/octet-stream' }); if (req.method !== 'HEAD') res.end(file); else res.end(); } catch (error) { json(res, 500, { error: error instanceof Error ? error.message : 'Internal server error' }); } }).listen(port, () => console.log(`AgentForge listening on :${port}`));
+createServer(async (req, res) => { try { if (req.url?.startsWith('/api/agents')) return agents(req, res); if (req.url?.startsWith('/api/agent-card')) return agentCard(req, res); if (req.url?.startsWith('/api/provider')) return provider(req, res); if (req.url?.startsWith('/api/executions')) return executions(req, res); if (req.method !== 'GET' && req.method !== 'HEAD') return json(res, 405, { error: 'Method not allowed' }); const pathname = new URL(req.url || '/', `http://${req.headers.host}`).pathname; const safe = normalize(pathname).replace(/^([.][.][/\\])+/, ''); const candidate = join(dist, safe === '/' ? 'index.html' : safe); let file; try { file = await readFile(candidate); } catch { file = await readFile(join(dist, 'index.html')); } res.writeHead(200, { 'content-type': mime[extname(candidate)] || 'application/octet-stream' }); if (req.method !== 'HEAD') res.end(file); else res.end(); } catch (error) { json(res, 500, { error: error instanceof Error ? error.message : 'Internal server error' }); } }).listen(port, () => console.log(`AgentForge listening on :${port}`));
