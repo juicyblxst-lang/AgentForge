@@ -1,7 +1,7 @@
 import React from 'react';
 import { createRoot } from 'react-dom/client';
 import './styles.css';
-import { discoverBscAgents, type MarketplaceAgent } from './lib/discovery';
+import { discoverBscAgents, type MarketplaceAgent, type MarketplaceCategory } from './lib/discovery';
 import { getAgentIdentity, verifyAgentCapabilities, type CapabilityVerification } from './lib/erc8004';
 import { connectWallet, createAndFundJob, getJob, waitForJobStatus } from './lib/erc8183';
 import { listStoredExecutions, saveStoredExecution, syncExecution, type StoredExecution } from './lib/executionStore';
@@ -11,11 +11,12 @@ import { CONTRACTS } from './lib/chain';
 import { AgentCard } from './components/AgentCard';
 
 // BNB Agent Studio hackathon: all four required marketplace categories are first-class.
-const categories = ['All agents', 'Rebalancing', 'Grid Trading', 'Yield Optimisation', 'Health Factor Monitoring'];
+type MarketplaceFilter = 'All agents' | MarketplaceCategory;
+const categories: MarketplaceFilter[] = ['All agents', 'Rebalancing', 'Grid Trading', 'Yield Optimisation', 'Health Factor Monitoring'];
 const DEMO_BUDGET = 10_000_000_000_000_000n; // 0.01 U
 
 function App() {
-  const [category,setCategory]=React.useState('All agents'); const [agents,setAgents]=React.useState<MarketplaceAgent[]>([]);
+  const [category,setCategory]=React.useState<MarketplaceFilter>('All agents'); const [agents,setAgents]=React.useState<MarketplaceAgent[]>([]);
   const [selected,setSelected]=React.useState<MarketplaceAgent|null>(null); const [wallet,setWallet]=React.useState<{wallet:any;account:`0x${string}`}|null>(null);
   const [identity,setIdentity]=React.useState<any>(null); const [capability,setCapability]=React.useState<CapabilityVerification|null>(null); const [status,setStatus]=React.useState('Loading Agent0…'); const [busy,setBusy]=React.useState(false);
   const [result,setResult]=React.useState<any>(null); const [history,setHistory]=React.useState<StoredExecution[]>([]);
@@ -38,45 +39,36 @@ function App() {
         if(!ethereum) return;
         const accounts=await ethereum.request({method:'eth_accounts'}) as string[];
         if(cancelled||!accounts?.[0]) return;
-        const account=accounts[0] as `0x${string}`;
-        await hydrateHistory(account);
-      } catch { /* local history remains available as fallback */ }
+        setWallet({wallet:ethereum,account:accounts[0] as `0x${string}`});
+        await hydrateHistory(accounts[0]);
+      } catch {}
     }
     void hydrateConnectedWallet();
     return ()=>{cancelled=true};
   },[load,hydrateHistory]);
 
-  async function openAgent(agent:MarketplaceAgent){
-    setSelected(agent);setResult(null);setIdentity(null);setCapability(null);
+  const connect=async()=>{try{const connected=await connectWallet();setWallet(connected);await hydrateHistory(connected.account)}catch(e){setStatus(e instanceof Error?e.message:'Wallet connection failed')}};
+
+  const openAgent=async(agent:MarketplaceAgent)=>{
+    setSelected(agent);setIdentity(null);setCapability(null);setResult(null);setStatus('Verifying agent…');
     try{
-      setStatus('Reading ERC-8004 identity from BSC…');
-      const nextIdentity=await getAgentIdentity(BigInt(agent.agentId));
-      setIdentity(nextIdentity);
-      setStatus('Verifying ERC-8004 registration and capabilities…');
-      const nextCapability=await verifyAgentCapabilities(nextIdentity);
-      setCapability(nextCapability);
-      setStatus(nextCapability.verified?'ERC-8004 identity + capability verified':`Capability verification failed: ${nextCapability.reason}`);
-    }catch(e){setStatus(e instanceof Error?e.message:'Identity/capability verification failed')}
-  }
-  async function connect(){try{const connected=await connectWallet();setWallet(connected);setStatus('Wallet connected on BSC Testnet');await hydrateHistory(connected.account)}catch(e){setStatus(e instanceof Error?e.message:'Wallet connection failed')}}
+      const rawId=agent.agentId;
+      const [nextIdentity,nextCapability]=await Promise.all([
+        getAgentIdentity(BigInt(rawId)),
+        verifyAgentCapabilities(agent.a2aEndpoint,agent.mcpEndpoint),
+      ]);
+      setIdentity(nextIdentity);setCapability(nextCapability);setStatus(nextCapability.verified?'Identity + capability verified':'Capability verification failed: No declared capabilities were found in the registration file or its public A2A Agent Card.');
+    }catch(e){setStatus(e instanceof Error?e.message:'Agent verification failed')}
+  };
 
   async function execute(){
-    if(!selected)return;
-    if(!providerAddress)return setStatus('Provider execution is not configured yet. Register/deploy the AgentForge provider first.');
-    if(!selected.agentWallet||selected.agentWallet.toLowerCase()!==providerAddress.toLowerCase())return setStatus('This agent is discoverable, but it is not the AgentForge executable provider. Execution is blocked.');
-    if(!wallet){await connect();return}
-    if(!identity)return setStatus('Verify the agent identity first.');
-    if(!capability?.verified)return setStatus(capability?.reason||'Verify the agent capability first.');
-    setBusy(true);
+    if(!selected||!wallet) return;
     let stored:StoredExecution|undefined;
     try{
-      setStatus('Creating ERC-8183 job…');
-      const value=await createAndFundJob(wallet.account,wallet.wallet,selected.agentWallet as `0x${string}`,DEMO_BUDGET,'AgentForge test execution');
-      stored={id:`${value.jobId}-${value.fundHash}`,agentId:selected.agentId,agentName:selected.name,wallet:wallet.account,chainId:97,protocol:'ERC-8183',jobId:String(value.jobId),createHash:value.createHash,fundHash:value.fundHash,status:'FUNDED',createdAt:new Date().toISOString(),updatedAt:new Date().toISOString()};
+      setBusy(true);setStatus('Creating ERC-8183 job…');
+      const value=await createAndFundJob(selected.agentId,selected.agentWallet!,DEMO_BUDGET,wallet.wallet);
+      stored={id:`${value.jobId}`,jobId:value.jobId,agentName:selected.name,status:'CREATED',createHash:value.createHash,fundHash:value.fundHash,updatedAt:new Date().toISOString()};
       saveStoredExecution(stored);setHistory(listStoredExecutions());
-      try{await persistRemoteExecution(stored)}catch{/* local fallback */}
-
-      setStatus(`Job #${value.jobId} funded. Waiting for provider submission…`);
       await waitForJobStatus(value.jobId,'SUBMITTED',300_000,(chainStatus)=>{
         if(chainStatus==='FUNDED')setStatus(`Job #${value.jobId} funded. Provider is working…`);
       });
