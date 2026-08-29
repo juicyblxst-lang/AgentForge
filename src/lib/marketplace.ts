@@ -1,4 +1,4 @@
-import { discoverBscAgents, type MarketplaceAgent } from './discovery';
+import { discoverBscAgents, type MarketplaceAgent, type MarketplaceCategory } from './discovery';
 import { getAgentIdentity } from './erc8004';
 
 export type VerifiedAgent = MarketplaceAgent & {
@@ -6,11 +6,10 @@ export type VerifiedAgent = MarketplaceAgent & {
   identityVerified: boolean;
 };
 
-export async function getMarketplaceAgents(category?: string) {
+export async function getMarketplaceAgents(category?: MarketplaceCategory | 'All agents') {
   const agents = await discoverBscAgents();
   if (!category || category === 'All agents') return agents;
-  const wanted = category.toLowerCase();
-  return agents.filter(a => a.capabilities.some(c => c.toLowerCase().includes(wanted)) || (a.description ?? '').toLowerCase().includes(wanted));
+  return agents.filter(agent => agent.categories.includes(category));
 }
 
 export async function verifyMarketplaceAgent(agent: MarketplaceAgent): Promise<VerifiedAgent> {
