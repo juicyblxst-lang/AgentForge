@@ -6,9 +6,11 @@ function decodeDataUri(uri) {
 }
 
 async function fetchJson(url, init = {}) {
+  console.log(`[erc8004-debug] FETCH url=${url}`);
   const response = await fetch(url, { ...init, headers: { accept: 'application/json', ...(init.headers || {}) } });
   const text = await response.text(); let body = null;
   try { body = text ? JSON.parse(text) : null; } catch { body = null; }
+  console.log(`[erc8004-debug] FETCH_RESULT url=${url} status=${response.status} ok=${response.ok} body=${JSON.stringify(body ?? text).slice(0, 20000)}`);
   if (!response.ok) throw new Error(`8004Scan request failed (${response.status}): ${text.slice(0, 300)}`);
   return body;
 }
@@ -18,11 +20,32 @@ function agentUriFromScan(body) { return body?.agent?.agentURI || body?.agentURI
 function servicesFromRegistration(registration) { const services = Array.isArray(registration?.services) ? registration.services : Array.isArray(registration?.endpoints) ? registration.endpoints : []; return services.filter(service => typeof service?.endpoint === 'string' && service.endpoint.trim()); }
 
 async function resolveRegistration(agentId, chainId) {
+  console.log(`[erc8004-debug] resolveRegistration START agentId=${agentId} chainId=${chainId}`);
   const headers = {}; if (process.env.AGENT8004SCAN_API_KEY) headers['X-API-Key'] = process.env.AGENT8004SCAN_API_KEY;
-  const body = await fetchJson(`${SCAN_BASE}/agents/${encodeURIComponent(chainId)}/${encodeURIComponent(agentId)}`, { headers });
+  const scanUrl = `${SCAN_BASE}/agents/${encodeURIComponent(chainId)}/${encodeURIComponent(agentId)}`;
+  const body = await fetchJson(scanUrl, { headers });
+  console.log(`[erc8004-debug] SCAN_RESPONSE agentId=${agentId} chainId=${chainId} fullResponse=${JSON.stringify(body).slice(0, 30000)}`);
   let registration = registrationFromScan(body); const agentURI = agentUriFromScan(body);
-  if (!registration && agentURI) { registration = decodeDataUri(agentURI); if (!registration) { const uri = agentURI.startsWith('ipfs://') ? `https://ipfs.io/ipfs/${agentURI.slice('ipfs://'.length)}` : agentURI; registration = await fetchJson(uri); } }
-  if (!registration) throw new Error(`ERC-8004 agent ${agentId} has no resolvable registration file`);
+  console.log(`[erc8004-debug] EXTRACTED agentId=${agentId} agentURI=${agentURI ?? 'null'} registration=${JSON.stringify(registration).slice(0, 30000)}`);
+  if (!registration && agentURI) {
+    registration = decodeDataUri(agentURI);
+    console.log(`[erc8004-debug] DATA_URI_DECODE agentId=${agentId} decoded=${JSON.stringify(registration).slice(0, 30000)}`);
+    if (!registration) {
+      const uri = agentURI.startsWith('ipfs://') ? `https://ipfs.io/ipfs/${agentURI.slice('ipfs://'.length)}` : agentURI;
+      console.log(`[erc8004-debug] REGISTRATION_FETCH_PREP agentId=${agentId} agentURI=${agentURI} finalFetchUrl=${uri}`);
+      try { registration = await fetchJson(uri); }
+      catch (error) {
+        console.error(`[erc8004-debug] REGISTRATION_FETCH_FAILED agentId=${agentId} agentURI=${agentURI} finalFetchUrl=${uri} error=${error instanceof Error ? error.message : String(error)}`);
+        throw error;
+      }
+      console.log(`[erc8004-debug] REGISTRATION_FETCH_RESULT agentId=${agentId} finalFetchUrl=${uri} registration=${JSON.stringify(registration).slice(0, 30000)}`);
+    }
+  }
+  if (!registration) {
+    console.error(`[erc8004-debug] UNRESOLVABLE_REGISTRATION agentId=${agentId} chainId=${chainId} fullScanResponse=${JSON.stringify(body).slice(0, 30000)} agentURI=${agentURI ?? 'null'} registration=${JSON.stringify(registration)}`);
+    throw new Error(`ERC-8004 agent ${agentId} has no resolvable registration file`);
+  }
+  console.log(`[erc8004-debug] resolveRegistration SUCCESS agentId=${agentId} chainId=${chainId} agentURI=${agentURI ?? 'null'} registration=${JSON.stringify(registration).slice(0, 30000)}`);
   return { registration, agentURI, scan: body };
 }
 
