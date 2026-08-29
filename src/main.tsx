@@ -10,7 +10,8 @@ import { verifyTransactionOnChain } from './lib/verification';
 import { CONTRACTS } from './lib/chain';
 import { AgentCard } from './components/AgentCard';
 
-const categories = ['All agents', 'Research', 'Trading', 'DeFi', 'Commerce'];
+// BNB Agent Studio hackathon: all four required marketplace categories are first-class.
+const categories = ['All agents', 'Rebalancing', 'Grid Trading', 'Yield Optimisation', 'Health Factor Monitoring'];
 const DEMO_BUDGET = 10_000_000_000_000_000n; // 0.01 U
 
 function App() {
