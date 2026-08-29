@@ -33,110 +33,34 @@ export function normalizeAgentURI(uri: string) {
   return uri;
 }
 
-async function readRegistration(uri: string): Promise<any> {
-  if (uri.startsWith('data:application/json;base64,')) {
-    const encoded = uri.slice('data:application/json;base64,'.length);
-    return JSON.parse(atob(encoded));
-  }
-  if (uri.startsWith('data:application/json,')) {
-    return JSON.parse(decodeURIComponent(uri.slice('data:application/json,'.length)));
-  }
-  const response = await fetch(normalizeAgentURI(uri));
-  if (!response.ok) throw new Error(`ERC-8004 registration could not be loaded (${response.status})`);
-  return response.json();
-}
-
-function strings(value: unknown): string[] {
-  return Array.isArray(value) ? value.filter((x): x is string => typeof x === 'string' && x.trim().length > 0) : [];
-}
-
-function capabilityStrings(value: unknown): string[] {
-  return strings(value).filter((value) => !/^https?:\/\//i.test(value) && !/^a2a:\s*https?:\/\//i.test(value));
-}
-
-function isA2AService(service: any): boolean {
-  const values = [service?.name, service?.type, service?.protocol, service?.kind, service?.serviceType]
-    .filter((value): value is string => typeof value === 'string')
-    .map((value) => value.trim().toLowerCase());
-
-  return values.some((value) => value === 'a2a' || value === 'a2a-http' || value === 'a2a_http' || value === 'a2a/https');
-}
-
-function endpointFromService(service: any): string | null {
-  const endpoint = service?.endpoint ?? service?.a2aEndpoint ?? service?.url;
-  return typeof endpoint === 'string' && endpoint.trim() ? endpoint.trim() : null;
-}
-
-async function readA2ACapabilities(endpoint: unknown): Promise<string[]> {
-  if (typeof endpoint !== 'string' || !endpoint || endpoint.includes('localhost') || endpoint.includes('127.0.0.1')) return [];
-  try {
-    const response = await fetch(`/api/agent-card?endpoint=${encodeURIComponent(endpoint)}`);
-    if (!response.ok) return [];
-    const data = await response.json();
-    if (!data?.verified || !Array.isArray(data.skills)) return [];
-    return data.skills.flatMap((skill: any) => {
-      const name = typeof skill?.name === 'string' ? skill.name.trim() : '';
-      const id = typeof skill?.id === 'string' ? skill.id.trim() : '';
-      const tags = capabilityStrings(skill?.tags);
-      return [name || id, ...tags].filter(Boolean);
-    });
-  } catch {
-    return [];
-  }
-}
-
 export async function verifyAgentCapabilities(identity: AgentIdentity): Promise<CapabilityVerification> {
-  const registration = await readRegistration(identity.agentURI);
-  const expectedRegistration = `eip155:${identity.chainId}:${CONTRACTS.identityRegistry.toLowerCase()}`;
-  const registrations = Array.isArray(registration?.registrations) ? registration.registrations : [];
-  const registrationBound = registrations.some((entry: any) =>
-    Number(entry?.agentId) === Number(identity.agentId) &&
-    String(entry?.agentRegistry ?? '').toLowerCase() === expectedRegistration,
-  );
-
-  const services = Array.isArray(registration?.services) ? registration.services : [];
-  const serviceCapabilities = services.flatMap((service: any) => {
-    const values: string[] = [];
-    values.push(...capabilityStrings(service?.skills));
-    values.push(...capabilityStrings(service?.tools));
-    values.push(...capabilityStrings(service?.a2aSkills));
-    values.push(...capabilityStrings(service?.mcpTools));
-    return values;
-  });
-
-  const fallbackCapabilities = [
-    ...capabilityStrings(registration?.capabilities),
-    ...capabilityStrings(registration?.a2aSkills),
-    ...capabilityStrings(registration?.mcpTools),
-  ];
-
-  // ERC-8004 registration files in the wild do not all use the same service
-  // field names. Accept the standard service endpoint plus the common
-  // a2aEndpoint/url variants, and also the top-level a2aEndpoint form used by
-  // Agent0 registrationFile data. Do not manufacture an endpoint.
-  const a2aEndpoints = [
-    ...services.filter(isA2AService).map(endpointFromService),
-    registration?.a2aEndpoint,
-  ].filter((endpoint: unknown, index: number, values: unknown[]): endpoint is string =>
-    typeof endpoint === 'string' && endpoint.trim().length > 0 && values.indexOf(endpoint) === index,
-  );
-
-  const a2aCardCapabilities = (await Promise.all(a2aEndpoints.map(readA2ACapabilities))).flat();
-  const uniqueCapabilities = [...new Set([...serviceCapabilities, ...fallbackCapabilities, ...a2aCardCapabilities])];
-  const active = registration?.active !== false;
-  const verified = registrationBound && active && uniqueCapabilities.length > 0;
-
-  return {
-    verified,
-    active,
-    registrationBound,
-    capabilities: uniqueCapabilities,
-    reason: verified
-      ? undefined
-      : !registrationBound
-        ? 'Registration file is not cryptographically bound to this ERC-8004 agent.'
-        : !active
-          ? 'Agent registration is marked inactive.'
-          : 'No declared capabilities were found in the registration file or its public A2A Agent Card.',
-  };
+  // Registration metadata and third-party Agent Cards are resolved server-side.
+  // This avoids browser CORS failures against arbitrary agent origins.
+  try {
+    const query = new URLSearchParams({
+      agentURI: normalizeAgentURI(identity.agentURI),
+      agentId: String(identity.agentId),
+      chainId: String(identity.chainId),
+    });
+    const response = await fetch(`/api/agent-capabilities?${query.toString()}`);
+    if (!response.ok) throw new Error(`Capability resolver returned ${response.status}`);
+    const data = await response.json();
+    return {
+      verified: Boolean(data?.verified),
+      active: data?.active !== false,
+      registrationBound: Boolean(data?.registrationBound),
+      capabilities: Array.isArray(data?.capabilities)
+        ? data.capabilities.filter((x: unknown): x is string => typeof x === 'string' && x.trim())
+        : [],
+      reason: typeof data?.reason === 'string' ? data.reason : undefined,
+    };
+  } catch {
+    return {
+      verified: false,
+      active: true,
+      registrationBound: false,
+      capabilities: [],
+      reason: 'Capability resolver could not be reached.',
+    };
+  }
 }
