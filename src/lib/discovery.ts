@@ -6,7 +6,7 @@ export type MarketplaceAgent = {
   categories: MarketplaceCategory[]; categoryEvidence: Partial<Record<MarketplaceCategory, string[]>>;
   categoryContext: Partial<Record<MarketplaceCategory, string>>;
   mcpEndpoint?: string; a2aEndpoint?: string; agentCardUrl?: string | null;
-  capabilitiesVerified?: boolean; active?: boolean;
+  capabilitiesVerified?: boolean; capabilitiesSource?: 'a2a_agent_card' | 'mcp_tools_list' | 'registration_file' | 'none'; active?: boolean;
 };
 
 // These are the four first-class BNB Agent Studio marketplace categories.
@@ -76,13 +76,14 @@ function classifyAgent(name: string, description: string | undefined, capabiliti
   return { categories, categoryEvidence };
 }
 
-async function resolveAgentCard(endpoint?: string) {
-  if (!endpoint || endpoint.includes('localhost') || endpoint.includes('127.0.0.1')) return null;
+async function resolveCapabilities(agentURI?: string, agentId?: string, chainId = 97) {
+  if (!agentURI || !agentId) return null;
   try {
-    const response = await fetch(`/api/agent-card?endpoint=${encodeURIComponent(endpoint)}`);
+    const params = new URLSearchParams({ agentURI, agentId, chainId: String(chainId) });
+    const response = await fetch(`/api/agent-capabilities?${params.toString()}`);
     if (!response.ok) return null;
     const data = await response.json();
-    return data?.agentCardUrl ? data : null;
+    return data && typeof data === 'object' ? data : null;
   } catch {
     return null;
   }
@@ -101,8 +102,13 @@ export async function discoverBscAgents(first = 100, skip = 0): Promise<Marketpl
   if (data.error) throw new Error(data.error);
   return Promise.all((data.agents ?? []).filter(a => Number(a.chainId) === 97).map(async a => {
     const rf = a.registrationFile ?? {};
-    const card = await resolveAgentCard(rf.a2aEndpoint);
-    const capabilities = collectCapabilities({ ...rf, a2aSkills: card?.skills ?? rf.a2aSkills });
+    const resolved = await resolveCapabilities(a.agentURI, String(a.agentId), 97);
+    const capabilities = [
+      ...new Set([
+        ...collectCapabilities(rf),
+        ...(Array.isArray(resolved?.capabilities) ? resolved.capabilities : []),
+      ]),
+    ];
     const name = rf.name || `Agent ${a.agentId}`;
     const classification = classifyAgent(name, rf.description, capabilities);
     return {
@@ -111,7 +117,10 @@ export async function discoverBscAgents(first = 100, skip = 0): Promise<Marketpl
       capabilities, categories: classification.categories, categoryEvidence: classification.categoryEvidence,
       categoryContext: Object.fromEntries(classification.categories.map(category => [category, categoryContext[category]])),
       mcpEndpoint: rf.mcpEndpoint, a2aEndpoint: rf.a2aEndpoint,
-      agentCardUrl: card?.agentCardUrl ?? null, capabilitiesVerified: !!card, active: rf.active
+      agentCardUrl: resolved?.agentCardUrl ?? null,
+      capabilitiesVerified: Boolean(resolved?.verified),
+      capabilitiesSource: resolved?.source ?? 'none',
+      active: rf.active
     };
   }));
 }
