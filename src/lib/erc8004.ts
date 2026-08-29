@@ -53,11 +53,13 @@ function strings(value: unknown): string[] {
 async function readA2ACapabilities(endpoint: unknown): Promise<string[]> {
   if (typeof endpoint !== 'string' || !endpoint || endpoint.includes('localhost') || endpoint.includes('127.0.0.1')) return [];
   try {
-    const response = await fetch(endpoint, { headers: { Accept: 'application/json' } });
+    // Resolve through our server so arbitrary agent origins do not need CORS
+    // permission from AgentForge. The server also validates the Agent Card shape.
+    const response = await fetch(`/api/agent-card?endpoint=${encodeURIComponent(endpoint)}`);
     if (!response.ok) return [];
-    const card = await response.json();
-    const skills = Array.isArray(card?.skills) ? card.skills : [];
-    return skills.flatMap((skill: any) => {
+    const data = await response.json();
+    if (!data?.verified || !Array.isArray(data.skills)) return [];
+    return data.skills.flatMap((skill: any) => {
       const name = typeof skill?.name === 'string' ? skill.name.trim() : '';
       const id = typeof skill?.id === 'string' ? skill.id.trim() : '';
       const tags = strings(skill?.tags);
