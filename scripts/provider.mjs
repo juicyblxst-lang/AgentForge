@@ -83,6 +83,62 @@ async function readJobs(jobIds) {
   return jobs;
 }
 
+function extractAgentText(value) {
+  const parts = value?.result?.message?.parts || value?.result?.artifacts?.flatMap((artifact) => artifact.parts || []) || value?.message?.parts || value?.parts;
+  if (Array.isArray(parts)) {
+    const text = parts.map((part) => part?.text ?? part?.content ?? "").filter(Boolean).join("\n");
+    if (text) return text;
+  }
+  if (typeof value?.result?.text === "string") return value.result.text;
+  if (typeof value?.text === "string") return value.text;
+  return null;
+}
+
+async function executeSelectedAgent(job) {
+  const messageId = `${job.id.toString()}-${Date.now()}`;
+  const body = {
+    jsonrpc: "2.0",
+    id: messageId,
+    method: "message/send",
+    params: {
+      message: {
+        messageId,
+        role: "user",
+        parts: [{ kind: "text", text: job.description }],
+      },
+    },
+  };
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), Number(process.env.ERC8183_AGENT_TIMEOUT_MS || 120000));
+  try {
+    const response = await fetch(agentUrl, {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json" },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+    const raw = await response.text();
+    let parsed = null;
+    try { parsed = raw ? JSON.parse(raw) : null; } catch { /* keep raw text */ }
+    if (!response.ok) throw new Error(`Agent endpoint returned HTTP ${response.status}: ${raw.slice(0, 500)}`);
+    if (parsed?.error) throw new Error(`Agent endpoint returned JSON-RPC error: ${JSON.stringify(parsed.error)}`);
+
+    const text = extractAgentText(parsed);
+    if (!text && !raw) throw new Error("Agent endpoint returned an empty response");
+
+    return {
+      protocol: "A2A message/send",
+      endpoint: agentUrl,
+      response: parsed ?? raw,
+      text: text ?? raw,
+      receivedAt: new Date().toISOString(),
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 async function pollJobs() {
   if (polling) return;
   polling = true;
@@ -90,11 +146,6 @@ async function pollJobs() {
   try {
     const counter = await client.commerce.jobCounter();
 
-    // Always rescan the recent job window instead of relying on an in-memory
-    // cursor. Jobs can be created between polls, and the worker must recover
-    // them after timing gaps or restarts. Scanning the latest batch is also
-    // idempotent because budgeted/funded state is tracked locally and the
-    // on-chain status is re-read before acting.
     const recentJobIds = [];
     const firstId = counter > BigInt(batchSize - 1) ? counter - BigInt(batchSize - 1) : 1n;
     for (let id = firstId; id <= counter; id += 1n) {
@@ -153,21 +204,29 @@ async function pollJobs() {
         }
 
         console.log(`[provider] funded job #${key}: ${job.description}`);
+
+        // Execute the selected marketplace agent first. The ERC-8183 provider
+        // remains the payer/submission identity, but the service result is now
+        // the actual response from the configured agent endpoint rather than
+        // a provider-generated placeholder.
+        const agentResult = await executeSelectedAgent(job);
+        console.log(`[provider] agent #${key} returned: ${agentResult.text.slice(0, 1000)}`);
+
         const deliverable = JSON.stringify({
           status: "completed",
           jobId: Number(job.id),
           provider: jobOps.agentAddress,
+          agentUrl,
           description: job.description,
+          executedByAgent: true,
+          agentResult,
           processedAt: new Date().toISOString(),
         });
 
-        // The SDK's Job type uses bigint for the on-chain job id, while
-        // ERC8183JobOps.submitResult() expects a JSON-manifest-safe number.
-        // Passing job.id directly makes DeliverableManifest canonical JSON
-        // throw "Do not know how to serialize a BigInt" before submit().
         const result = await jobOps.submitResult(Number(job.id), deliverable, {
           agentforge: true,
-          worker: "agentforge-provider-v1",
+          worker: "agentforge-provider-v2",
+          executedAgent: true,
         });
 
         if (!result.success) {
@@ -192,7 +251,7 @@ console.log(`[provider] network=${network}`);
 console.log(`[provider] servicePrice=${servicePrice}`);
 console.log(`[provider] polling mode=recent jobCounter/getJob (no eth_getLogs)`);
 console.log(`[provider] batchSize=${batchSize}`);
-console.log("[provider] waiting for OPEN jobs to set budget, then FUNDED jobs to execute");
+console.log(`[provider] waiting for OPEN jobs to set budget, then FUNDED jobs to execute selected agent and submit its result`);
 
 await pollJobs();
 setInterval(() => void pollJobs(), pollIntervalMs);
