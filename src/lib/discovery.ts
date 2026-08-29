@@ -37,10 +37,15 @@ function classifyAgent(name: string, description: string | undefined, capabiliti
 }
 
 export async function discoverBscAgents(first = 100, skip = 0): Promise<MarketplaceAgent[]> {
-  // Query BSC Testnet at the source instead of requesting a global slice and
-  // filtering it client-side. This prevents the marketplace from accidentally
-  // showing only one BSC agent when the global index is dominated by other chains.
-  const params = new URLSearchParams({ first: String(Math.min(Math.max(first, 1), 100)), skip: String(Math.max(skip, 0)), chainId: '97' });
+  // Ask the API to discover BSC registrations that actually advertise a service.
+  // This avoids wasting the first page on inert registrations and gives the
+  // marketplace useful live agents instead of a tiny arbitrary slice.
+  const params = new URLSearchParams({
+    first: String(Math.min(Math.max(first, 1), 100)),
+    skip: String(Math.max(skip, 0)),
+    chainId: '97',
+    servicesOnly: 'true',
+  });
   const response = await fetch(`/api/agents?${params.toString()}`);
   if (!response.ok) throw new Error(`Agent discovery failed (${response.status})`);
   const data = await response.json() as { agents?: any[]; error?: string };
