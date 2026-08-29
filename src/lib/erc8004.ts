@@ -50,7 +50,7 @@ export async function verifyAgentCapabilities(identity: AgentIdentity): Promise<
       active: data?.active === undefined ? true : Boolean(data.active),
       registrationBound: Boolean(data?.registrationBound),
       capabilities: Array.isArray(data?.capabilities)
-        ? data.capabilities.filter((x: unknown): x is string => typeof x === 'string' && x.trim())
+        ? data.capabilities.filter((x: unknown): x is string => typeof x === 'string' && Boolean(x.trim()))
         : [],
       reason: typeof data?.reason === 'string' ? data.reason : undefined,
     };
