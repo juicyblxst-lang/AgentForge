@@ -19,6 +19,8 @@ if (!agentUrl) throw new Error("ERC8183_AGENT_URL is required for the provider w
 const port = Number(process.env.PORT || 3000);
 const pollIntervalMs = Number(process.env.ERC8183_FUNDED_POLL_INTERVAL || 30) * 1000;
 const batchSize = Number(process.env.ERC8183_JOB_BATCH_SIZE || 50);
+const maxRetries = Number(process.env.ERC8183_MAX_AGENT_RETRIES || 3);
+const retryBackoffMs = Number(process.env.ERC8183_RETRY_BACKOFF_MS || 5000);
 
 const wallet = new EVMWalletProvider({
   password: process.env.WALLET_PASSWORD,
@@ -37,31 +39,15 @@ const jobOps = await ERC8183JobOps.create({
 
 const httpServer = createServer((req, res) => {
   if (req.method === "GET" && req.url === "/status") {
-    res.writeHead(200, {
-      "content-type": "application/json; charset=utf-8",
-      "cache-control": "no-store",
-    });
-    res.end(JSON.stringify({
-      status: "ok",
-      service: "agentforge-provider",
-      network,
-      chainId: 97,
-      agentWallet: jobOps.agentAddress,
-      servicePrice: servicePrice.toString(),
-      agentUrl,
-    }));
+    res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+    res.end(JSON.stringify({ status: "ok", service: "agentforge-provider", network, chainId: 97, agentWallet: jobOps.agentAddress, servicePrice: servicePrice.toString(), agentUrl }));
     return;
   }
-
   if (req.method === "GET" && req.url === "/health") {
-    res.writeHead(200, {
-      "content-type": "application/json; charset=utf-8",
-      "cache-control": "no-store",
-    });
+    res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
     res.end(JSON.stringify({ status: "ok", service: "agentforge-provider" }));
     return;
   }
-
   res.writeHead(404, { "content-type": "application/json; charset=utf-8" });
   res.end(JSON.stringify({ error: "Not found" }));
 });
@@ -71,6 +57,8 @@ httpServer.listen(port, () => console.log(`[provider] HTTP status server listeni
 const budgeted = new Set();
 const funded = new Set();
 const open = new Set();
+const terminalFailures = new Set();
+const retryState = new Map();
 let polling = false;
 
 async function readJobs(jobIds) {
@@ -120,42 +108,36 @@ async function executeSelectedAgent(job) {
     });
     const raw = await response.text();
     let parsed = null;
-    try { parsed = raw ? JSON.parse(raw) : null; } catch { /* keep raw text */ }
+    try { parsed = raw ? JSON.parse(raw) : null; } catch {}
     if (!response.ok) throw new Error(`Agent endpoint returned HTTP ${response.status}: ${raw.slice(0, 500)}`);
     if (parsed?.error) throw new Error(`Agent endpoint returned JSON-RPC error: ${JSON.stringify(parsed.error)}`);
-
     const text = extractAgentText(parsed);
     if (!text && !raw) throw new Error("Agent endpoint returned an empty response");
+    return { protocol: "A2A message/send", endpoint: agentUrl, response: parsed ?? raw, text: text ?? raw, receivedAt: new Date().toISOString() };
+  } finally { clearTimeout(timeout); }
+}
 
-    return {
-      protocol: "A2A message/send",
-      endpoint: agentUrl,
-      response: parsed ?? raw,
-      text: text ?? raw,
-      receivedAt: new Date().toISOString(),
-    };
-  } finally {
-    clearTimeout(timeout);
-  }
+function classifyError(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  const status = message.match(/HTTP\s+(\d{3})/i)?.[1];
+  if (status && /^4\d\d$/.test(status)) return "terminal";
+  return "retryable";
 }
 
 async function pollJobs() {
   if (polling) return;
   polling = true;
-
   try {
     const counter = await client.commerce.jobCounter();
-
     const recentJobIds = [];
     const firstId = counter > BigInt(batchSize - 1) ? counter - BigInt(batchSize - 1) : 1n;
-    for (let id = firstId; id <= counter; id += 1n) {
-      recentJobIds.push(id);
-    }
+    for (let id = firstId; id <= counter; id += 1n) recentJobIds.push(id);
 
     for (const job of await readJobs(recentJobIds)) {
-      if (job.provider.toLowerCase() !== jobOps.agentAddress.toLowerCase()) continue;
-      if (job.status === 0) open.add(job.id.toString());
-      if (job.status === 1) funded.add(job.id.toString());
+      const key = job.id.toString();
+      if (job.provider.toLowerCase() !== jobOps.agentAddress.toLowerCase() || terminalFailures.has(key)) continue;
+      if (job.status === 0) open.add(key);
+      if (job.status === 1) funded.add(key);
     }
 
     const tracked = new Set([...open, ...budgeted, ...funded]);
@@ -165,19 +147,12 @@ async function pollJobs() {
     for (const key of tracked) {
       try {
         const job = await client.getJob(BigInt(key));
-        if (job.provider.toLowerCase() !== jobOps.agentAddress.toLowerCase()) {
-          open.delete(key);
-          budgeted.delete(key);
-          funded.delete(key);
-          continue;
+        if (job.provider.toLowerCase() !== jobOps.agentAddress.toLowerCase() || terminalFailures.has(key)) {
+          open.delete(key); budgeted.delete(key); funded.delete(key); continue;
         }
         if (job.status === 0) openIds.add(key);
         else if (job.status === 1) fundedIds.add(key);
-        else {
-          open.delete(key);
-          budgeted.delete(key);
-          funded.delete(key);
-        }
+        else { open.delete(key); budgeted.delete(key); funded.delete(key); }
       } catch (error) {
         console.error(`[provider] getJob(${key}) failed:`, error instanceof Error ? error.message : error);
       }
@@ -188,70 +163,60 @@ async function pollJobs() {
       try {
         const result = await client.setBudget(BigInt(key), servicePrice);
         console.log(`[provider] set budget for #${key}: ${result.txHash || result.transactionHash || "submitted"}`);
-        budgeted.add(key);
-        open.delete(key);
+        budgeted.add(key); open.delete(key);
       } catch (error) {
         console.error(`[provider] setBudget failed for #${key}:`, error instanceof Error ? error.message : error);
       }
     }
 
     for (const key of fundedIds) {
+      if (terminalFailures.has(key)) continue;
+      const state = retryState.get(key) || { attempts: 0, nextAt: 0 };
+      if (state.attempts >= maxRetries || Date.now() < state.nextAt) continue;
       try {
         const job = await client.getJob(BigInt(key));
-        if (job.status !== 1) {
-          funded.delete(key);
-          continue;
-        }
-
+        if (job.status !== 1) { funded.delete(key); continue; }
         console.log(`[provider] funded job #${key}: ${job.description}`);
-
-        // Execute the selected marketplace agent first. The ERC-8183 provider
-        // remains the payer/submission identity, but the service result is now
-        // the actual response from the configured agent endpoint rather than
-        // a provider-generated placeholder.
         const agentResult = await executeSelectedAgent(job);
         console.log(`[provider] agent #${key} returned: ${agentResult.text.slice(0, 1000)}`);
-
-        const deliverable = JSON.stringify({
-          status: "completed",
-          jobId: Number(job.id),
-          provider: jobOps.agentAddress,
-          agentUrl,
-          description: job.description,
-          executedByAgent: true,
-          agentResult,
-          processedAt: new Date().toISOString(),
-        });
-
-        const result = await jobOps.submitResult(Number(job.id), deliverable, {
-          agentforge: true,
-          worker: "agentforge-provider-v2",
-          executedAgent: true,
-        });
-
+        const deliverable = JSON.stringify({ status: "completed", jobId: Number(job.id), provider: jobOps.agentAddress, agentUrl, description: job.description, executedByAgent: true, agentResult, processedAt: new Date().toISOString() });
+        const result = await jobOps.submitResult(Number(job.id), deliverable, { agentforge: true, worker: "agentforge-provider-v2", executedAgent: true });
         if (!result.success) {
-          console.error(`[provider] submit failed for #${key}: ${result.error}`);
-          if (result.retryable !== true) funded.delete(key);
+          if (result.retryable === true && state.attempts + 1 < maxRetries) {
+            const attempts = state.attempts + 1;
+            retryState.set(key, { attempts, nextAt: Date.now() + Math.min(retryBackoffMs * 2 ** (attempts - 1), 60000) });
+            console.error(`[provider] submit failed for #${key}; retry ${attempts}: ${result.error}`);
+          } else {
+            terminalFailures.add(key); funded.delete(key); console.error(`[provider] terminal submit failure for #${key}: ${result.error}`);
+          }
           continue;
         }
-
         console.log(`[provider] submitted #${key}: ${result.txHash}`);
-        funded.delete(key);
+        funded.delete(key); retryState.delete(key);
       } catch (error) {
-        console.error(`[provider] funded job #${key} failed:`, error instanceof Error ? error.message : error);
+        const info = error instanceof Error ? error.message : String(error);
+        if (classifyError(error) === "terminal") {
+          terminalFailures.add(key); funded.delete(key); retryState.delete(key);
+          console.error(`[provider] terminal agent failure for #${key}: ${info}`);
+        } else {
+          const attempts = state.attempts + 1;
+          if (attempts >= maxRetries) {
+            terminalFailures.add(key); funded.delete(key);
+            console.error(`[provider] retry limit reached for #${key}: ${info}`);
+          } else {
+            retryState.set(key, { attempts, nextAt: Date.now() + Math.min(retryBackoffMs * 2 ** (attempts - 1), 60000) });
+            console.error(`[provider] funded job #${key} transient failure; retry ${attempts}: ${info}`);
+          }
+        }
       }
     }
-  } finally {
-    polling = false;
-  }
+  } finally { polling = false; }
 }
 
 console.log(`[provider] address=${jobOps.agentAddress}`);
 console.log(`[provider] network=${network}`);
 console.log(`[provider] servicePrice=${servicePrice}`);
 console.log(`[provider] polling mode=recent jobCounter/getJob (no eth_getLogs)`);
-console.log(`[provider] batchSize=${batchSize}`);
-console.log(`[provider] waiting for OPEN jobs to set budget, then FUNDED jobs to execute selected agent and submit its result`);
-
+console.log(`[provider] retry policy=max ${maxRetries}, exponential backoff`);
 await pollJobs();
 setInterval(() => void pollJobs(), pollIntervalMs);
