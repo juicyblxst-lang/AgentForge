@@ -62,11 +62,14 @@ function isA2AService(service: any): boolean {
   return values.some((value) => value === 'a2a' || value === 'a2a-http' || value === 'a2a_http' || value === 'a2a/https');
 }
 
+function endpointFromService(service: any): string | null {
+  const endpoint = service?.endpoint ?? service?.a2aEndpoint ?? service?.url;
+  return typeof endpoint === 'string' && endpoint.trim() ? endpoint.trim() : null;
+}
+
 async function readA2ACapabilities(endpoint: unknown): Promise<string[]> {
   if (typeof endpoint !== 'string' || !endpoint || endpoint.includes('localhost') || endpoint.includes('127.0.0.1')) return [];
   try {
-    // The Agent Card is fetched by AgentForge's server-side resolver so the
-    // third-party agent does not need to enable browser CORS for our origin.
     const response = await fetch(`/api/agent-card?endpoint=${encodeURIComponent(endpoint)}`);
     if (!response.ok) return [];
     const data = await response.json();
@@ -107,10 +110,16 @@ export async function verifyAgentCapabilities(identity: AgentIdentity): Promise<
     ...capabilityStrings(registration?.mcpTools),
   ];
 
-  const a2aEndpoints = services
-    .filter(isA2AService)
-    .map((service: any) => service?.endpoint)
-    .filter((endpoint: unknown): endpoint is string => typeof endpoint === 'string');
+  // ERC-8004 registration files in the wild do not all use the same service
+  // field names. Accept the standard service endpoint plus the common
+  // a2aEndpoint/url variants, and also the top-level a2aEndpoint form used by
+  // Agent0 registrationFile data. Do not manufacture an endpoint.
+  const a2aEndpoints = [
+    ...services.filter(isA2AService).map(endpointFromService),
+    registration?.a2aEndpoint,
+  ].filter((endpoint: unknown, index: number, values: unknown[]): endpoint is string =>
+    typeof endpoint === 'string' && endpoint.trim().length > 0 && values.indexOf(endpoint) === index,
+  );
 
   const a2aCardCapabilities = (await Promise.all(a2aEndpoints.map(readA2ACapabilities))).flat();
   const uniqueCapabilities = [...new Set([...serviceCapabilities, ...fallbackCapabilities, ...a2aCardCapabilities])];
