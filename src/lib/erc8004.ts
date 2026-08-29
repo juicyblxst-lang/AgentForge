@@ -50,6 +50,18 @@ function strings(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((x): x is string => typeof x === 'string' && x.trim().length > 0) : [];
 }
 
+function capabilityStrings(value: unknown): string[] {
+  return strings(value).filter((value) => !/^https?:\/\//i.test(value) && !/^a2a:\s*https?:\/\//i.test(value));
+}
+
+function isA2AService(service: any): boolean {
+  const values = [service?.name, service?.type, service?.protocol, service?.kind, service?.serviceType]
+    .filter((value): value is string => typeof value === 'string')
+    .map((value) => value.trim().toLowerCase());
+
+  return values.some((value) => value === 'a2a' || value === 'a2a-http' || value === 'a2a_http' || value === 'a2a/https');
+}
+
 async function readA2ACapabilities(endpoint: unknown): Promise<string[]> {
   if (typeof endpoint !== 'string' || !endpoint || endpoint.includes('localhost') || endpoint.includes('127.0.0.1')) return [];
   try {
@@ -62,7 +74,7 @@ async function readA2ACapabilities(endpoint: unknown): Promise<string[]> {
     return data.skills.flatMap((skill: any) => {
       const name = typeof skill?.name === 'string' ? skill.name.trim() : '';
       const id = typeof skill?.id === 'string' ? skill.id.trim() : '';
-      const tags = strings(skill?.tags);
+      const tags = capabilityStrings(skill?.tags);
       return [name || id, ...tags].filter(Boolean);
     });
   } catch {
@@ -82,21 +94,21 @@ export async function verifyAgentCapabilities(identity: AgentIdentity): Promise<
   const services = Array.isArray(registration?.services) ? registration.services : [];
   const serviceCapabilities = services.flatMap((service: any) => {
     const values: string[] = [];
-    values.push(...strings(service?.skills));
-    values.push(...strings(service?.tools));
-    values.push(...strings(service?.a2aSkills));
-    values.push(...strings(service?.mcpTools));
+    values.push(...capabilityStrings(service?.skills));
+    values.push(...capabilityStrings(service?.tools));
+    values.push(...capabilityStrings(service?.a2aSkills));
+    values.push(...capabilityStrings(service?.mcpTools));
     return values;
   });
 
   const fallbackCapabilities = [
-    ...strings(registration?.capabilities),
-    ...strings(registration?.a2aSkills),
-    ...strings(registration?.mcpTools),
+    ...capabilityStrings(registration?.capabilities),
+    ...capabilityStrings(registration?.a2aSkills),
+    ...capabilityStrings(registration?.mcpTools),
   ];
 
   const a2aEndpoints = services
-    .filter((service: any) => String(service?.name ?? service?.type ?? '').toUpperCase() === 'A2A')
+    .filter(isA2AService)
     .map((service: any) => service?.endpoint)
     .filter((endpoint: unknown): endpoint is string => typeof endpoint === 'string');
 
