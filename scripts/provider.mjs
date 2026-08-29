@@ -2,7 +2,7 @@ import { createServer } from "node:http";
 import { EVMWalletProvider, ERC8183Client, loadEnv } from "@bnbagent/sdk";
 import { ERC8183JobOps } from "@bnbagent/sdk/erc8183";
 import { LocalStorageProvider } from "@bnbagent/sdk/storage";
-import { extractAgentRoute, resolveAgentService } from "./erc8004-agent.mjs";
+import { extractAgentRoute, resolveAgentService, resolveAgentServiceForWallet } from "./erc8004-agent.mjs";
 
 loadEnv();
 
@@ -143,14 +143,24 @@ async function executeSelectedAgent(job, service) {
 }
 
 async function executeDynamicAgent(job) {
-  const route = extractAgentRoute(job.description);
-  if (!route) throw new Error("ERC-8183 job does not contain an ERC-8004 agent id for dynamic routing");
-
-  const service = await resolveAgentService(route.agentId, route.chainId);
-  console.log(`[provider] resolved ERC-8004 #${route.agentId} -> ${service.serviceName} ${service.endpoint}`);
-
-  const agentResult = await executeSelectedAgent(job, service);
-  return { route, service, agentResult };
+  // The ERC-8183 job.provider is the selected marketplace agent wallet.
+  // Resolve the agent identity from that wallet through 8004Scan instead of
+  // requiring an endpoint or agent ID environment variable for every agent.
+  try {
+    const service = await resolveAgentServiceForWallet(job.provider, 97);
+    console.log(`[provider] resolved selected wallet ${job.provider} -> ERC-8004 #${service.agentId} ${service.serviceName} ${service.endpoint}`);
+    const agentResult = await executeSelectedAgent(job, service);
+    return { route: { agentId: service.agentId, chainId: 97, source: "job.provider" }, service, agentResult };
+  } catch (walletError) {
+    // Backward compatibility for jobs created by the previous experimental
+    // branch. New jobs should never need this fallback.
+    const route = extractAgentRoute(job.description);
+    if (!route) throw walletError;
+    const service = await resolveAgentService(route.agentId, route.chainId);
+    console.log(`[provider] legacy route fallback ERC-8004 #${route.agentId} -> ${service.serviceName} ${service.endpoint}`);
+    const agentResult = await executeSelectedAgent(job, service);
+    return { route: { ...route, source: "legacy-description" }, service, agentResult };
+  }
 }
 
 async function pollJobs() {
