@@ -1,34 +1,45 @@
+export type MarketplaceCategory = 'Rebalancing' | 'Grid Trading' | 'Yield Optimisation' | 'Health Factor Monitoring';
+
 export type MarketplaceAgent = {
   id: string; agentId: string; chainId: number; name: string; description?: string;
   owner?: string; agentWallet?: string; agentURI?: string; capabilities: string[];
-  categories: string[]; mcpEndpoint?: string; a2aEndpoint?: string; agentCardUrl?: string | null;
+  categories: MarketplaceCategory[]; categoryEvidence: Partial<Record<MarketplaceCategory, string[]>>;
+  categoryContext: Partial<Record<MarketplaceCategory, string>>;
+  mcpEndpoint?: string; a2aEndpoint?: string; agentCardUrl?: string | null;
   capabilitiesVerified?: boolean; active?: boolean;
 };
 
 // These are the four first-class BNB Agent Studio marketplace categories.
-// Keep classification evidence-driven: use the agent's name, description and
-// declared capabilities, without inventing a category when there is no signal.
-const categoryKeywords: Record<string, string[]> = {
+// Classification is evidence-driven: name, description and declared capabilities
+// are inspected together. A category is never assigned from a UI label alone.
+const categoryKeywords: Record<MarketplaceCategory, string[]> = {
   'Rebalancing': [
-    'rebalanc', 'range management', 'lp range', 'liquidity range',
+    'rebalanc', 'range management', 'range keeper', 'lp range', 'liquidity range',
     'position management', 'position rebalance', 'concentrated liquidity',
-    'liquidity management', 'auto-compound'
+    'liquidity management', 'auto-compound', 'portfolio allocation', 'allocation drift'
   ],
   'Grid Trading': [
-    'grid trading', 'grid trader', 'grid bot', 'grid strategy',
-    'grid order', 'grid orders', 'automated grid', 'range orders'
+    'grid trading', 'grid trader', 'grid bot', 'grid strategy', 'grid order',
+    'grid orders', 'automated grid', 'range orders', 'grid levels', 'grid spacing'
   ],
   'Yield Optimisation': [
     'yield optim', 'yield optimizer', 'yield optimisation', 'yield optimization',
     'apr', 'apy', 'yield', 'staking', 'liquidity mining', 'vault',
-    'highest yield', 'best yield', 'yield routing'
+    'highest yield', 'best yield', 'yield routing', 'yield venue', 'yield rebalanc'
   ],
   'Health Factor Monitoring': [
     'health factor', 'liquidation', 'liquidation risk', 'liquidation protection',
     'lending position', 'lending positions', 'borrow position', 'borrow positions',
-    'collateral health', 'collateral ratio', 'venus lending', 'venus health',
-    'borrow health', 'loan health'
+    'collateral health', 'collateral ratio', 'safe borrow', 'borrow health',
+    'loan health', 'venus lending', 'venus health', 'lending risk', 'liquidation threshold'
   ],
+};
+
+const categoryContext: Record<MarketplaceCategory, string> = {
+  'Rebalancing': 'Automates liquidity or portfolio rebalancing while keeping the strategy and position context visible.',
+  'Grid Trading': 'Automates grid-based order placement and management with the trading pair and grid strategy as the execution context.',
+  'Yield Optimisation': 'Compares or routes capital toward better yield opportunities using the agent’s declared yield strategy and venues.',
+  'Health Factor Monitoring': 'Monitors lending and collateral risk, with the health factor and liquidation boundary as the core decision context.',
 };
 
 function collectCapabilities(rf: any): string[] {
@@ -49,11 +60,20 @@ function collectCapabilities(rf: any): string[] {
   return [...new Set(values)];
 }
 
-function classifyAgent(name: string, description: string | undefined, capabilities: string[]): string[] {
+function classifyAgent(name: string, description: string | undefined, capabilities: string[]) {
   const haystack = [name, description ?? '', ...capabilities].join(' ').toLowerCase();
-  return Object.entries(categoryKeywords)
-    .filter(([, keywords]) => keywords.some(keyword => haystack.includes(keyword)))
-    .map(([category]) => category);
+  const categoryEvidence = {} as Partial<Record<MarketplaceCategory, string[]>>;
+  const categories: MarketplaceCategory[] = [];
+
+  for (const [category, keywords] of Object.entries(categoryKeywords) as [MarketplaceCategory, string[]][]) {
+    const matches = keywords.filter(keyword => haystack.includes(keyword));
+    if (matches.length) {
+      categories.push(category);
+      categoryEvidence[category] = matches;
+    }
+  }
+
+  return { categories, categoryEvidence };
 }
 
 async function resolveAgentCard(endpoint?: string) {
@@ -84,10 +104,12 @@ export async function discoverBscAgents(first = 100, skip = 0): Promise<Marketpl
     const card = await resolveAgentCard(rf.a2aEndpoint);
     const capabilities = collectCapabilities({ ...rf, a2aSkills: card?.skills ?? rf.a2aSkills });
     const name = rf.name || `Agent ${a.agentId}`;
+    const classification = classifyAgent(name, rf.description, capabilities);
     return {
       id: String(a.id), agentId: String(a.agentId), chainId: 97, name,
       description: rf.description, owner: a.owner, agentWallet: a.agentWallet, agentURI: a.agentURI,
-      capabilities, categories: classifyAgent(name, rf.description, capabilities),
+      capabilities, categories: classification.categories, categoryEvidence: classification.categoryEvidence,
+      categoryContext: Object.fromEntries(classification.categories.map(category => [category, categoryContext[category]])),
       mcpEndpoint: rf.mcpEndpoint, a2aEndpoint: rf.a2aEndpoint,
       agentCardUrl: card?.agentCardUrl ?? null, capabilitiesVerified: !!card, active: rf.active
     };
