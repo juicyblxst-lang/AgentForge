@@ -9,30 +9,11 @@ export type MarketplaceAgent = {
   capabilitiesVerified?: boolean; capabilitiesSource?: 'a2a_agent_card' | 'mcp_tools_list' | 'registration_file' | 'none'; active?: boolean;
 };
 
-// These are the four first-class BNB Agent Studio marketplace categories.
-// Classification is evidence-driven: name, description and declared capabilities
-// are inspected together. A category is never assigned from a UI label alone.
 const categoryKeywords: Record<MarketplaceCategory, string[]> = {
-  'Rebalancing': [
-    'rebalanc', 'range management', 'range keeper', 'lp range', 'liquidity range',
-    'position management', 'position rebalance', 'concentrated liquidity',
-    'liquidity management', 'auto-compound', 'portfolio allocation', 'allocation drift'
-  ],
-  'Grid Trading': [
-    'grid trading', 'grid trader', 'grid bot', 'grid strategy', 'grid order',
-    'grid orders', 'automated grid', 'range orders', 'grid levels', 'grid spacing'
-  ],
-  'Yield Optimisation': [
-    'yield optim', 'yield optimizer', 'yield optimisation', 'yield optimization',
-    'apr', 'apy', 'yield', 'staking', 'liquidity mining', 'vault',
-    'highest yield', 'best yield', 'yield routing', 'yield venue', 'yield rebalanc'
-  ],
-  'Health Factor Monitoring': [
-    'health factor', 'liquidation', 'liquidation risk', 'liquidation protection',
-    'lending position', 'lending positions', 'borrow position', 'borrow positions',
-    'collateral health', 'collateral ratio', 'safe borrow', 'borrow health',
-    'loan health', 'venus lending', 'venus health', 'lending risk', 'liquidation threshold'
-  ],
+  'Rebalancing': ['rebalanc', 'range management', 'range keeper', 'lp range', 'liquidity range', 'position management', 'position rebalance', 'concentrated liquidity', 'liquidity management', 'auto-compound', 'portfolio allocation', 'allocation drift'],
+  'Grid Trading': ['grid trading', 'grid trader', 'grid bot', 'grid strategy', 'grid order', 'grid orders', 'automated grid', 'range orders', 'grid levels', 'grid spacing'],
+  'Yield Optimisation': ['yield optim', 'yield optimizer', 'yield optimisation', 'yield optimization', 'apr', 'apy', 'yield', 'staking', 'liquidity mining', 'vault', 'highest yield', 'best yield', 'yield routing', 'yield venue', 'yield rebalanc'],
+  'Health Factor Monitoring': ['health factor', 'liquidation', 'liquidation risk', 'liquidation protection', 'lending position', 'lending positions', 'borrow position', 'borrow positions', 'collateral health', 'collateral ratio', 'safe borrow', 'borrow health', 'loan health', 'venus lending', 'venus health', 'lending risk', 'liquidation threshold'],
 };
 
 const categoryContext: Record<MarketplaceCategory, string> = {
@@ -54,8 +35,7 @@ function collectCapabilities(rf: any): string[] {
   };
   addArray(rf.mcpTools); addArray(rf.a2aSkills); addArray(rf.skills); addArray(rf.tools); addArray(rf.capabilities);
   if (Array.isArray(rf.services)) rf.services.forEach((service: any) => {
-    add(service?.name);
-    addArray(service?.mcpTools); addArray(service?.a2aSkills); addArray(service?.skills); addArray(service?.tools); addArray(service?.capabilities);
+    add(service?.name); addArray(service?.mcpTools); addArray(service?.a2aSkills); addArray(service?.skills); addArray(service?.tools); addArray(service?.capabilities);
   });
   return [...new Set(values)];
 }
@@ -64,15 +44,10 @@ function classifyAgent(name: string, description: string | undefined, capabiliti
   const haystack = [name, description ?? '', ...capabilities].join(' ').toLowerCase();
   const categoryEvidence = {} as Partial<Record<MarketplaceCategory, string[]>>;
   const categories: MarketplaceCategory[] = [];
-
   for (const [category, keywords] of Object.entries(categoryKeywords) as [MarketplaceCategory, string[]][]) {
     const matches = keywords.filter(keyword => haystack.includes(keyword));
-    if (matches.length) {
-      categories.push(category);
-      categoryEvidence[category] = matches;
-    }
+    if (matches.length) { categories.push(category); categoryEvidence[category] = matches; }
   }
-
   return { categories, categoryEvidence };
 }
 
@@ -84,18 +59,11 @@ async function resolveCapabilities(agentURI?: string, agentId?: string, chainId 
     if (!response.ok) return null;
     const data = await response.json();
     return data && typeof data === 'object' ? data : null;
-  } catch {
-    return null;
-  }
+  } catch { return null; }
 }
 
-export async function discoverBscAgents(first = 100, skip = 0): Promise<MarketplaceAgent[]> {
-  const params = new URLSearchParams({
-    first: String(Math.min(Math.max(first, 1), 100)),
-    skip: String(Math.max(skip, 0)),
-    chainId: '97',
-    servicesOnly: 'true',
-  });
+export async function discoverBscAgents(first = 500, skip = 0): Promise<MarketplaceAgent[]> {
+  const params = new URLSearchParams({ first: String(Math.min(Math.max(first, 1), 500)), skip: String(Math.max(skip, 0)), chainId: '97', servicesOnly: 'true' });
   const response = await fetch(`/api/agents?${params.toString()}`);
   if (!response.ok) throw new Error(`Agent discovery failed (${response.status})`);
   const data = await response.json() as { agents?: any[]; error?: string };
@@ -103,24 +71,16 @@ export async function discoverBscAgents(first = 100, skip = 0): Promise<Marketpl
   return Promise.all((data.agents ?? []).filter(a => Number(a.chainId) === 97).map(async a => {
     const rf = a.registrationFile ?? {};
     const resolved = await resolveCapabilities(a.agentURI, String(a.agentId), 97);
-    const capabilities = [
-      ...new Set([
-        ...collectCapabilities(rf),
-        ...(Array.isArray(resolved?.capabilities) ? resolved.capabilities : []),
-      ]),
-    ];
+    const capabilities = [...new Set([...collectCapabilities(rf), ...(Array.isArray(resolved?.capabilities) ? resolved.capabilities : [])])];
     const name = rf.name || `Agent ${a.agentId}`;
     const classification = classifyAgent(name, rf.description, capabilities);
     return {
-      id: String(a.id), agentId: String(a.agentId), chainId: 97, name,
-      description: rf.description, owner: a.owner, agentWallet: a.agentWallet, agentURI: a.agentURI,
-      capabilities, categories: classification.categories, categoryEvidence: classification.categoryEvidence,
+      id: String(a.id), agentId: String(a.agentId), chainId: 97, name, description: rf.description,
+      owner: a.owner, agentWallet: a.agentWallet, agentURI: a.agentURI, capabilities,
+      categories: classification.categories, categoryEvidence: classification.categoryEvidence,
       categoryContext: Object.fromEntries(classification.categories.map(category => [category, categoryContext[category]])),
-      mcpEndpoint: rf.mcpEndpoint, a2aEndpoint: rf.a2aEndpoint,
-      agentCardUrl: resolved?.agentCardUrl ?? null,
-      capabilitiesVerified: Boolean(resolved?.verified),
-      capabilitiesSource: resolved?.source ?? 'none',
-      active: rf.active
+      mcpEndpoint: rf.mcpEndpoint, a2aEndpoint: rf.a2aEndpoint, agentCardUrl: resolved?.agentCardUrl ?? null,
+      capabilitiesVerified: Boolean(resolved?.verified), capabilitiesSource: resolved?.source ?? 'none', active: rf.active,
     };
   }));
 }
