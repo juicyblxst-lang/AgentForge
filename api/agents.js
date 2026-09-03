@@ -11,7 +11,7 @@ async function discoverServiceAgents(endpoint, apiKey, chainId, requested) {
   const pageSize = 100;
   const matches = [];
   let skip = 0;
-  const maxPages = 20;
+  const maxPages = 100;
   for (let page = 0; page < maxPages && matches.length < requested; page += 1) {
     const data = await graphRequest(endpoint, apiKey, AGENTS_QUERY, { first: pageSize, skip, where: { chainId: String(chainId) } });
     const agents = data.agents ?? [];
@@ -19,8 +19,6 @@ async function discoverServiceAgents(endpoint, apiKey, chainId, requested) {
     for (const agent of agents) {
       const registration = agent.registrationFile ?? {};
       if (registration.active === false) continue;
-      // Do not require mcpEndpoint/a2aEndpoint here. ERC-8004 registration-v1
-      // documents can legitimately have endpoints: [] while still being live agents.
       if (!agent.agentURI && !registration.name && !registration.description) continue;
       matches.push(agent);
       if (matches.length >= requested) break;
@@ -39,13 +37,13 @@ export default async function handler(req, res) {
   if (!apiKey && !process.env.AGENT0_GRAPH_URL) return res.status(503).json({ error: 'AGENT0_GRAPH_API_KEY is not configured on the server' });
   try {
     const url = new URL(req.url, `https://${req.headers.host || 'localhost'}`);
-    const first = Math.min(Math.max(Number(url.searchParams.get('first') || 20), 1), 100);
+    const first = Math.min(Math.max(Number(url.searchParams.get('first') || 500), 1), 500);
     const skip = Math.max(Number(url.searchParams.get('skip') || 0), 0);
     const chainId = url.searchParams.get('chainId');
     const servicesOnly = url.searchParams.get('servicesOnly') === 'true';
     if (servicesOnly && chainId) {
       const agents = await discoverServiceAgents(endpoint, apiKey, chainId, first);
-      return res.status(200).json({ agents, pagination: { first, skip: 0, returned: agents.length }, filters: { chainId, servicesOnly: true } });
+      return res.status(200).json({ agents, pagination: { first, skip: 0, returned: agents.length, exhaustive: agents.length < first }, filters: { chainId, servicesOnly: true } });
     }
     const where = {};
     if (chainId) where.chainId = chainId;
