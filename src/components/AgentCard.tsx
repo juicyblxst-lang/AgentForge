@@ -6,6 +6,7 @@ export function AgentCard({ agent, onOpen }: { agent: MarketplaceAgent; onOpen: 
     <div className="agent-card-body">
       <div className="agent-title-row"><h3>{agent.name}</h3><span className="verified-dot">ERC-8004</span></div>
       <p>{agent.description || 'On-chain agent on BSC Testnet.'}</p>
+      {agent.categories.length > 0 && <div className="chips">{agent.categories.map(category => <span key={category}>{category}</span>)}</div>}
       <div className="chips">{agent.capabilities.slice(0, 4).map(c => <span key={c}>{c}</span>)}</div>
       <button className="text-button" onClick={onOpen}>Open agent →</button>
     </div>
