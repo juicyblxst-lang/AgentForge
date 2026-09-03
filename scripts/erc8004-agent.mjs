@@ -23,6 +23,22 @@ function walletFromRecord(record) { return record?.agentWallet ?? record?.agent?
 function normalizeAddress(value) { return typeof value === 'string' && /^0x[a-fA-F0-9]{40}$/.test(value) ? value.toLowerCase() : null; }
 async function resolveAgentIdByWallet(agentWallet, chainId) { const normalizedWallet = normalizeAddress(agentWallet); if (!normalizedWallet) throw new Error(`Invalid selected agent wallet: ${agentWallet}`); const headers = {}; if (process.env.AGENT8004SCAN_API_KEY) headers['X-API-Key'] = process.env.AGENT8004SCAN_API_KEY; const listUrl = `${SCAN_BASE}/agents?chainId=${encodeURIComponent(chainId)}&owner_address=${encodeURIComponent(agentWallet)}&page=1&pageSize=100`; const body = await fetchJson(listUrl, { headers }); debug('WALLET_AGENT_LIST_RESPONSE', { agentWallet, chainId: Number(chainId), listUrl, response: body }); const records = Array.isArray(body) ? body : (body?.agents || body?.data?.agents || body?.data || []); if (!Array.isArray(records)) throw new Error(`8004Scan returned an unexpected agent-list response for wallet ${agentWallet}`); const match = records.find(record => normalizeAddress(walletFromRecord(record)) === normalizedWallet); const agentId = agentIdFromRecord(match); debug('WALLET_AGENT_RESOLUTION', { agentWallet, chainId: Number(chainId), matchedRecord: match, agentId }); if (!agentId) throw new Error(`No ERC-8004 agent found on chain ${chainId} for selected agent wallet ${agentWallet}`); return agentId; }
 function isA2AService(service) { return /^a2a$/i.test(service?.name || '') || /a2a|agent.?card/i.test(service?.name || ''); }
+function normalizeA2AExecutionUrl(value, cardUrl) {
+  if (typeof value !== 'string' || !/^https?:\/\//i.test(value)) return null;
+  try {
+    const candidate = new URL(value);
+    const card = new URL(cardUrl);
+    // AgentCards sometimes advertise their base URL as plain HTTP even when
+    // the card itself is served over HTTPS. For a remote HTTPS-hosted card,
+    // upgrade only the same-host HTTP URL; never invent a different host.
+    if (candidate.protocol === 'http:' && card.protocol === 'https:' && candidate.hostname === card.hostname) {
+      candidate.protocol = 'https:';
+    }
+    return candidate.toString().replace(/\/$/, '');
+  } catch {
+    return value;
+  }
+}
 async function resolveA2AExecutionEndpoint(service, agentId) {
   if (!isA2AService(service)) return service.endpoint;
   const card = await fetchJson(service.endpoint);
@@ -32,7 +48,7 @@ async function resolveA2AExecutionEndpoint(service, agentId) {
     card?.serviceEndpoint,
     ...(Array.isArray(card?.supportedInterfaces) ? card.supportedInterfaces.map(item => item?.url || item?.endpoint) : []),
     ...(Array.isArray(card?.endpoints) ? card.endpoints.map(item => typeof item === 'string' ? item : item?.url || item?.endpoint) : []),
-  ].filter(value => typeof value === 'string' && /^https?:\/\//i.test(value));
+  ].map(value => normalizeA2AExecutionUrl(value, service.endpoint)).filter(Boolean);
   const executionEndpoint = candidates[0] || null;
   debug('A2A_AGENT_CARD_RESOLUTION', { agentId: String(agentId), cardUrl: service.endpoint, executionEndpoint, candidates, card });
   if (!executionEndpoint) throw new Error(`A2A agent ${agentId} returned an AgentCard without an executable endpoint`);
