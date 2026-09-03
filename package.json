@@ -7,8 +7,9 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "start": "node server.mjs",
-    "provider": "node scripts/provider.mjs",
+    "provider": "node --import ./scripts/env-debug.mjs scripts/provider.mjs",
     "register:provider": "node scripts/register-provider.mjs",
+    "discovery:poc": "node scripts/erc8004-discovery-poc.mjs",
     "preview": "vite preview",
     "test": "vitest run",
     "test:watch": "vitest",
@@ -25,7 +26,6 @@
   "devDependencies": {
     "@types/react": "^19.1.10",
     "@types/react-dom": "^19.1.7",
-    "@vitejs/plugin-react": "^5.0.2",
     "typescript": "^5.9.2",
     "vite": "^7.1.3",
     "vitest": "^3.2.4"
