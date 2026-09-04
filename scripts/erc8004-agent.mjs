@@ -24,12 +24,54 @@ async function resolveRegistration(agentId, chainId) { debug('RESOLVE_START', { 
 function agentIdFromRecord(record) { const value = record?.agentId ?? record?.agent?.agentId ?? record?.tokenId ?? record?.agent?.tokenId; return value == null ? null : String(value); }
 function walletFromRecord(record) { return record?.agentWallet ?? record?.agent?.agentWallet ?? record?.wallet ?? record?.agent?.wallet ?? null; }
 function normalizeAddress(value) { return typeof value === 'string' && /^0x[a-fA-F0-9]{40}$/.test(value) ? value.toLowerCase() : null; }
-async function resolveAgentIdByWallet(agentWallet, chainId) { const normalizedWallet = normalizeAddress(agentWallet); if (!normalizedWallet) throw new Error(`Invalid selected agent wallet: ${agentWallet}`); const headers = {}; if (process.env.AGENT8004SCAN_API_KEY) headers['X-API-Key'] = process.env.AGENT8004SCAN_API_KEY; const listUrl = `${SCAN_BASE}/agents?chainId=${encodeURIComponent(chainId)}&owner_address=${encodeURIComponent(agentWallet)}&page=1&pageSize=100`; const body = await fetchJson(listUrl, { headers }); const records = Array.isArray(body) ? body : (body?.agents || body?.data?.agents || body?.data || []); if (!Array.isArray(records)) throw new Error(`8004Scan returned an unexpected agent-list response for wallet ${agentWallet}`); const match = records.find(record => normalizeAddress(walletFromRecord(record)) === normalizedWallet); const agentId = agentIdFromRecord(match); if (!agentId) throw new Error(`No ERC-8004 agent found on chain ${chainId} for selected agent wallet ${agentWallet}`); return agentId; }
+async function resolveAgentIdByWallet(agentWallet, chainId) { const normalizedWallet = normalizeAddress(agentWallet); if (!normalizedWallet) throw new Error(`Invalid selected agent wallet: ${agentWallet}`); const headers = {}; if (process.env.AGENT8004SCAN_API_KEY) headers['X-API-Key'] = process.env.AGENT8004SCAN_API_KEY; const listUrl = `${SCAN_BASE}/agents?chainId=${encodeURIComponent(chainId)}&owner_address=${encodeURIComponent(agentWallet)}&page=1&pageSize=100`; const body = await fetchJson(listUrl, { headers }); const records = Array.isArray(body) ? body : (body?.agents || body?.data?.agents || body?.items || body?.data || []); if (!Array.isArray(records)) throw new Error(`8004Scan returned an unexpected agent-list response for wallet ${agentWallet}`); const match = records.find(record => normalizeAddress(walletFromRecord(record)) === normalizedWallet); const agentId = agentIdFromRecord(match); if (!agentId) throw new Error(`No ERC-8004 agent found on chain ${chainId} for selected agent wallet ${agentWallet}`); return agentId; }
 function isA2AService(service) { const kind = serviceKind(service); return /^a2a$/i.test(kind) || /a2a|agent.?card/i.test(kind); }
 function isMcpService(service) { const kind = serviceKind(service); return /^mcp$/i.test(kind) || /model.?context/i.test(kind); }
 function isERC8183Service(service) { return /erc.?8183/i.test(`${serviceKind(service)} ${service?.endpoint || ''}`); }
 function normalizeA2AExecutionUrl(value, cardUrl) { const normalized = normalizeEndpoint(value); if (!normalized) return null; try { const candidate = new URL(normalized); const card = new URL(cardUrl); if (candidate.protocol === 'http:' && card.protocol === 'https:' && candidate.hostname === card.hostname) candidate.protocol = 'https:'; return candidate.toString().replace(/\/$/, ''); } catch { return normalized; } }
-async function resolveA2AExecutionEndpoint(service, agentId) { if (!isA2AService(service)) return service.endpoint; const card = await fetchJson(service.endpoint); const candidates = [card?.url, card?.endpoint, card?.serviceEndpoint, ...(Array.isArray(card?.supportedInterfaces) ? card.supportedInterfaces.map(item => item?.url || item?.endpoint) : []), ...(Array.isArray(card?.endpoints) ? card.endpoints.map(item => typeof item === 'string' ? item : item?.url || item?.endpoint) : [])].map(value => normalizeA2AExecutionUrl(value, service.endpoint)).filter(Boolean); const executionEndpoint = candidates[0] || null; debug('A2A_AGENT_CARD_RESOLUTION', { agentId: String(agentId), cardUrl: service.endpoint, executionEndpoint, candidates }); if (!executionEndpoint) throw new Error(`A2A agent ${agentId} returned an AgentCard without an executable endpoint`); return executionEndpoint; }
-export async function resolveAgentService(agentId, chainId = 97) { const { registration, agentURI, scan } = await resolveRegistration(agentId, chainId); const services = servicesFromRegistration(registration); debug('SERVICE_EXTRACTION', { agentId: String(agentId), services }); const preferred = services.find(isA2AService) || services.find(isERC8183Service) || services.find(isMcpService) || services.find(service => Boolean(normalizeEndpoint(service.endpoint))); if (!preferred) throw new Error(`ERC-8004 agent ${agentId} has no executable HTTP service endpoint`); const endpoint = await resolveA2AExecutionEndpoint(preferred, agentId); const protocol = isA2AService(preferred) ? 'a2a' : isERC8183Service(preferred) ? 'erc-8183' : isMcpService(preferred) ? 'mcp' : 'custom'; return { agentId: String(agentId), chainId: Number(chainId), agentURI, name: registration.name, serviceName: preferred.name || protocol, endpoint, registrationEndpoint: preferred.endpoint, version: preferred.version, protocol, registration, scan }; }
+function interfaceProtocolVersion(item, fallback = '0.3') { const value = item?.protocolVersion ?? item?.protocol_version ?? item?.version; return typeof value === 'string' && value ? value : fallback; }
+function interfaceBinding(item, fallback = 'JSONRPC') { return String(item?.protocolBinding ?? item?.protocol_binding ?? item?.transport ?? item?.preferredTransport ?? fallback).trim(); }
+async function resolveA2AExecutionEndpoint(service, agentId) {
+  if (!isA2AService(service)) return { endpoint: service.endpoint, protocolVersion: service.version || null, protocolBinding: interfaceBinding(service, 'HTTP+JSON') };
+  const card = await fetchJson(service.endpoint);
+  const interfaces = Array.isArray(card?.supportedInterfaces) ? card.supportedInterfaces : [];
+  const candidates = interfaces.map(item => ({
+    endpoint: normalizeA2AExecutionUrl(item?.url || item?.endpoint, service.endpoint),
+    protocolVersion: interfaceProtocolVersion(item, card?.protocolVersion || service.version || '0.3'),
+    protocolBinding: interfaceBinding(item, card?.preferredTransport || 'JSONRPC'),
+    tenant: item?.tenant || null,
+  })).filter(item => item.endpoint);
+  if (!candidates.length) {
+    const legacyEndpoint = normalizeA2AExecutionUrl(card?.url || card?.endpoint || card?.serviceEndpoint, service.endpoint);
+    if (legacyEndpoint) candidates.push({ endpoint: legacyEndpoint, protocolVersion: card?.protocolVersion || service.version || '0.3', protocolBinding: card?.preferredTransport || 'JSONRPC', tenant: null });
+  }
+  const execution = candidates[0] || null;
+  debug('A2A_AGENT_CARD_RESOLUTION', { agentId: String(agentId), cardUrl: service.endpoint, execution, candidates, cardVersion: card?.protocolVersion || null });
+  if (!execution) throw new Error(`A2A agent ${agentId} returned an AgentCard without an executable endpoint`);
+  return { ...execution, card };
+}
+export async function resolveAgentService(agentId, chainId = 97) {
+  const { registration, agentURI, scan } = await resolveRegistration(agentId, chainId);
+  const services = servicesFromRegistration(registration);
+  debug('SERVICE_EXTRACTION', { agentId: String(agentId), services });
+  const preferred = services.find(isA2AService) || services.find(isERC8183Service) || services.find(isMcpService) || services.find(service => Boolean(normalizeEndpoint(service.endpoint)));
+  if (!preferred) throw new Error(`ERC-8004 agent ${agentId} has no executable HTTP service endpoint`);
+  const resolved = await resolveA2AExecutionEndpoint(preferred, agentId);
+  const protocol = isA2AService(preferred) ? 'a2a' : isERC8183Service(preferred) ? 'erc-8183' : isMcpService(preferred) ? 'mcp' : 'custom';
+  return {
+    agentId: String(agentId), chainId: Number(chainId), agentURI, name: registration.name,
+    serviceName: preferred.name || protocol,
+    endpoint: resolved.endpoint,
+    registrationEndpoint: preferred.endpoint,
+    version: resolved.protocolVersion || preferred.version || null,
+    protocolVersion: resolved.protocolVersion || preferred.version || null,
+    protocolBinding: resolved.protocolBinding || null,
+    tenant: resolved.tenant || null,
+    protocol,
+    agentCard: resolved.card || null,
+    registration,
+    scan,
+  };
+}
 export async function resolveAgentServiceForWallet(agentWallet, chainId = 97) { const agentId = await resolveAgentIdByWallet(agentWallet, chainId); return resolveAgentService(agentId, chainId); }
 export function extractAgentRoute(description) { const match = String(description || '').match(/ERC-8004 agent\s+(\d+)/i); return match ? { agentId: match[1], chainId: 97 } : null; }
