@@ -1,20 +1,21 @@
-name: AgentForge build
+name: build
 
 on:
   push:
-    branches: [main]
+    branches: [main, submission-hardening]
   pull_request:
+    branches: [main]
 
 jobs:
-  build:
+  verify:
     runs-on: ubuntu-latest
-    env:
-      VITE_BSC_TESTNET_RPC_URL: ${{ vars.BSC_TESTNET_RPC_URL }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: npm
-      - run: npm install
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
       - run: npm run build
