@@ -12,13 +12,24 @@ function normalizeEndpoint(value) { if (typeof value !== 'string' || !/^https?:\
 function serviceKind(service) { return String(service?.name ?? service?.type ?? service?.protocol ?? service?.kind ?? '').trim().toLowerCase(); }
 function servicesFromRegistration(registration) {
   const raw = Array.isArray(registration?.services) ? registration.services : Array.isArray(registration?.endpoints) ? registration.endpoints : [];
-  return raw.map(service => {
+  const services = raw.map(service => {
     if (typeof service === 'string') return { name: 'custom', endpoint: normalizeEndpoint(service) };
     if (!service || typeof service !== 'object') return null;
     const endpoint = normalizeEndpoint(service.endpoint) || normalizeEndpoint(service.url) || normalizeEndpoint(service.a2aEndpoint) || normalizeEndpoint(service.mcpEndpoint);
     if (!endpoint) return null;
     return { ...service, endpoint };
   }).filter(Boolean);
+
+  // Some ERC-8004 indexers expose A2A/MCP endpoints as top-level registration fields
+  // rather than entries in the standard services/endpoints array. Normalize those
+  // fields into the same internal service shape so execution sees the same data that
+  // discovery already surfaces.
+  const topLevelA2A = normalizeEndpoint(registration?.a2aEndpoint);
+  const topLevelMcp = normalizeEndpoint(registration?.mcpEndpoint);
+  if (topLevelA2A) services.push({ name: 'a2a', endpoint: topLevelA2A });
+  if (topLevelMcp) services.push({ name: 'mcp', endpoint: topLevelMcp });
+
+  return services;
 }
 async function resolveRegistration(agentId, chainId) { debug('RESOLVE_START', { agentId: String(agentId), chainId: Number(chainId) }); const headers = {}; if (process.env.AGENT8004SCAN_API_KEY) headers['X-API-Key'] = process.env.AGENT8004SCAN_API_KEY; const scanUrl = `${SCAN_BASE}/agents/${encodeURIComponent(chainId)}/${encodeURIComponent(agentId)}`; const body = await fetchJson(scanUrl, { headers }); let registration = registrationFromScan(body); const agentURI = agentUriFromScan(body); const rawMetadata = rawMetadataFromScan(body); if (!registration && rawMetadata) registration = normalizeRawMetadata(rawMetadata); if (!registration && agentURI) { registration = decodeDataUri(agentURI); if (!registration) { const uri = agentURI.startsWith('ipfs://') ? `https://ipfs.io/ipfs/${agentURI.slice(7)}` : agentURI; registration = await fetchJson(uri); } } if (!registration) throw new Error(`ERC-8004 agent ${agentId} has no resolvable registration file`); debug('REGISTRATION_SUCCESS', { agentId: String(agentId), chainId: Number(chainId), agentURI, registration }); return { registration, agentURI, scan: body }; }
 function agentIdFromRecord(record) { const value = record?.agentId ?? record?.agent?.agentId ?? record?.tokenId ?? record?.agent?.tokenId; return value == null ? null : String(value); }
