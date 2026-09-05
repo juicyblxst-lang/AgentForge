@@ -7,6 +7,12 @@ async function graphRequest(endpoint, apiKey, query, variables) {
   return body.data;
 }
 
+function hasExecutableService(agent) {
+  const registration = agent.registrationFile ?? {};
+  const endpoints = [registration.a2aEndpoint, registration.mcpEndpoint];
+  return endpoints.some((endpoint) => typeof endpoint === 'string' && /^https?:\/\//i.test(endpoint));
+}
+
 async function discoverServiceAgents(endpoint, apiKey, chainId, requested) {
   const pageSize = 100;
   const matches = [];
@@ -19,7 +25,7 @@ async function discoverServiceAgents(endpoint, apiKey, chainId, requested) {
     for (const agent of agents) {
       const registration = agent.registrationFile ?? {};
       if (registration.active === false) continue;
-      if (!agent.agentURI && !registration.name && !registration.description) continue;
+      if (!hasExecutableService(agent)) continue;
       matches.push(agent);
       if (matches.length >= requested) break;
     }
