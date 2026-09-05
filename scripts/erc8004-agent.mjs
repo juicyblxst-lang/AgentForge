@@ -19,16 +19,10 @@ function servicesFromRegistration(registration) {
     if (!endpoint) return null;
     return { ...service, endpoint };
   }).filter(Boolean);
-
-  // Some ERC-8004 indexers expose A2A/MCP endpoints as top-level registration fields
-  // rather than entries in the standard services/endpoints array. Normalize those
-  // fields into the same internal service shape so execution sees the same data that
-  // discovery already surfaces.
   const topLevelA2A = normalizeEndpoint(registration?.a2aEndpoint);
   const topLevelMcp = normalizeEndpoint(registration?.mcpEndpoint);
   if (topLevelA2A) services.push({ name: 'a2a', endpoint: topLevelA2A });
   if (topLevelMcp) services.push({ name: 'mcp', endpoint: topLevelMcp });
-
   return services;
 }
 async function resolveRegistration(agentId, chainId) { debug('RESOLVE_START', { agentId: String(agentId), chainId: Number(chainId) }); const headers = {}; if (process.env.AGENT8004SCAN_API_KEY) headers['X-API-Key'] = process.env.AGENT8004SCAN_API_KEY; const scanUrl = `${SCAN_BASE}/agents/${encodeURIComponent(chainId)}/${encodeURIComponent(agentId)}`; const body = await fetchJson(scanUrl, { headers }); let registration = registrationFromScan(body); const agentURI = agentUriFromScan(body); const rawMetadata = rawMetadataFromScan(body); if (!registration && rawMetadata) registration = normalizeRawMetadata(rawMetadata); if (!registration && agentURI) { registration = decodeDataUri(agentURI); if (!registration) { const uri = agentURI.startsWith('ipfs://') ? `https://ipfs.io/ipfs/${agentURI.slice(7)}` : agentURI; registration = await fetchJson(uri); } } if (!registration) throw new Error(`ERC-8004 agent ${agentId} has no resolvable registration file`); debug('REGISTRATION_SUCCESS', { agentId: String(agentId), chainId: Number(chainId), agentURI, registration }); return { registration, agentURI, scan: body }; }
@@ -46,16 +40,8 @@ async function resolveA2AExecutionEndpoint(service, agentId) {
   if (!isA2AService(service)) return { endpoint: service.endpoint, protocolVersion: service.version || null, protocolBinding: interfaceBinding(service, 'HTTP+JSON') };
   const card = await fetchJson(service.endpoint);
   const interfaces = Array.isArray(card?.supportedInterfaces) ? card.supportedInterfaces : [];
-  const candidates = interfaces.map(item => ({
-    endpoint: normalizeA2AExecutionUrl(item?.url || item?.endpoint, service.endpoint),
-    protocolVersion: interfaceProtocolVersion(item, card?.protocolVersion || service.version || '0.3'),
-    protocolBinding: interfaceBinding(item, card?.preferredTransport || 'JSONRPC'),
-    tenant: item?.tenant || null,
-  })).filter(item => item.endpoint);
-  if (!candidates.length) {
-    const legacyEndpoint = normalizeA2AExecutionUrl(card?.url || card?.endpoint || card?.serviceEndpoint, service.endpoint);
-    if (legacyEndpoint) candidates.push({ endpoint: legacyEndpoint, protocolVersion: card?.protocolVersion || service.version || '0.3', protocolBinding: card?.preferredTransport || 'JSONRPC', tenant: null });
-  }
+  const candidates = interfaces.map(item => ({ endpoint: normalizeA2AExecutionUrl(item?.url || item?.endpoint, service.endpoint), protocolVersion: interfaceProtocolVersion(item, card?.protocolVersion || service.version || '0.3'), protocolBinding: interfaceBinding(item, card?.preferredTransport || 'JSONRPC'), tenant: item?.tenant || null })).filter(item => item.endpoint);
+  if (!candidates.length) { const legacyEndpoint = normalizeA2AExecutionUrl(card?.url || card?.endpoint || card?.serviceEndpoint, service.endpoint); if (legacyEndpoint) candidates.push({ endpoint: legacyEndpoint, protocolVersion: card?.protocolVersion || service.version || '0.3', protocolBinding: card?.preferredTransport || 'JSONRPC', tenant: null }); }
   const execution = candidates[0] || null;
   debug('A2A_AGENT_CARD_RESOLUTION', { agentId: String(agentId), cardUrl: service.endpoint, execution, candidates, cardVersion: card?.protocolVersion || null });
   if (!execution) throw new Error(`A2A agent ${agentId} returned an AgentCard without an executable endpoint`);
@@ -65,10 +51,20 @@ export async function resolveAgentService(agentId, chainId = 97) {
   const { registration, agentURI, scan } = await resolveRegistration(agentId, chainId);
   const services = servicesFromRegistration(registration);
   debug('SERVICE_EXTRACTION', { agentId: String(agentId), services });
-  const preferred = services.find(isA2AService) || services.find(isERC8183Service) || services.find(isMcpService) || services.find(service => Boolean(normalizeEndpoint(service.endpoint)));
-  if (!preferred) throw new Error(`ERC-8004 agent ${agentId} has no executable HTTP service endpoint`);
+
+  // ERC-8183 /status and /health endpoints are provider-management surfaces,
+  // not task-execution transports. An ERC-8183 provider's funded-job handler is
+  // invoked by its own on-chain poller, so AgentForge cannot execute a selected
+  // agent by POSTing an arbitrary task to that status URL. Only A2A, MCP, or an
+  // explicitly advertised non-ERC-8183 HTTP service may be used for execution.
+  const executableServices = services.filter(service => !isERC8183Service(service));
+  const preferred = executableServices.find(isA2AService) || executableServices.find(isMcpService) || executableServices.find(service => Boolean(normalizeEndpoint(service.endpoint)));
+  if (!preferred) {
+    throw new Error(`ERC-8004 agent ${agentId} has no executable service; ERC-8183 status/health endpoints are not task transports`);
+  }
+
   const resolved = await resolveA2AExecutionEndpoint(preferred, agentId);
-  const protocol = isA2AService(preferred) ? 'a2a' : isERC8183Service(preferred) ? 'erc-8183' : isMcpService(preferred) ? 'mcp' : 'custom';
+  const protocol = isA2AService(preferred) ? 'a2a' : isMcpService(preferred) ? 'mcp' : 'custom';
   return {
     agentId: String(agentId), chainId: Number(chainId), agentURI, name: registration.name,
     serviceName: preferred.name || protocol,
