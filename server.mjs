@@ -1,7 +1,10 @@
 import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
 import { extname, join, normalize } from 'node:path';
 import { createClient } from '@supabase/supabase-js';
+import agentCapabilities from './api/agent-capabilities.js';
+import providerExecute from './api/provider-execute.js';
 
 const root = fileURLToPath(new URL('.', import.meta.url));
 const dist = join(root, 'dist');
@@ -20,6 +23,17 @@ const AGENT_CARD_TTL_MS = 6 * 60 * 60 * 1000;
 
 function json(res, status, body) { res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' }); res.end(JSON.stringify(body)); }
 async function readBody(req) { let body = ''; for await (const chunk of req) body += chunk; if (body.length > 100_000) throw new Error('Request body too large'); return JSON.parse(body || '{}'); }
+
+function mountApiHandler(handler, req, res, body) {
+  req.body = body;
+  res.status = (statusCode) => { res.statusCode = statusCode; return res; };
+  res.json = (payload) => {
+    if (!res.headersSent) res.setHeader('content-type', 'application/json; charset=utf-8');
+    res.end(JSON.stringify(payload));
+    return res;
+  };
+  return handler(req, res);
+}
 
 function isPublicHttpUrl(value) {
   try {
@@ -114,4 +128,13 @@ async function executions(req, res) {
 }
 
 const mime = { '.html':'text/html; charset=utf-8', '.js':'text/javascript; charset=utf-8', '.css':'text/css; charset=utf-8', '.json':'application/json; charset=utf-8', '.svg':'image/svg+xml', '.png':'image/png', '.ico':'image/x-icon' };
-createServer(async (req, res) => { try { if (req.url?.startsWith('/api/agents')) return agents(req, res); if (req.url?.startsWith('/api/agent-card')) return agentCard(req, res); if (req.url?.startsWith('/api/provider')) return provider(req, res); if (req.url?.startsWith('/api/executions')) return executions(req, res); if (req.method !== 'GET' && req.method !== 'HEAD') return json(res, 405, { error: 'Method not allowed' }); const pathname = new URL(req.url || '/', `http://${req.headers.host}`).pathname; const safe = normalize(pathname).replace(/^([.][.][/\\])+/, ''); const candidate = join(dist, safe === '/' ? 'index.html' : safe); let file; try { file = await readFile(candidate); } catch { file = await readFile(join(dist, 'index.html')); } res.writeHead(200, { 'content-type': mime[extname(candidate)] || 'application/octet-stream' }); if (req.method !== 'HEAD') res.end(file); else res.end(); } catch (error) { json(res, 500, { error: error instanceof Error ? error.message : 'Internal server error' }); } }).listen(port, () => console.log(`AgentForge listening on :${port}`));
+createServer(async (req, res) => { try {
+  if (req.url?.startsWith('/api/agent-capabilities')) return mountApiHandler(agentCapabilities, req, res);
+  if (req.url?.startsWith('/api/provider-execute')) { const body = await readBody(req); return mountApiHandler(providerExecute, req, res, body); }
+  if (req.url?.startsWith('/api/agents')) return agents(req, res);
+  if (req.url?.startsWith('/api/agent-card')) return agentCard(req, res);
+  if (req.url?.startsWith('/api/provider')) return provider(req, res);
+  if (req.url?.startsWith('/api/executions')) return executions(req, res);
+  if (req.method !== 'GET' && req.method !== 'HEAD') return json(res, 405, { error: 'Method not allowed' });
+  const pathname = new URL(req.url || '/', `http://${req.headers.host}`).pathname; const safe = normalize(pathname).replace(/^([.][.][/\\])+/, ''); const candidate = join(dist, safe === '/' ? 'index.html' : safe); let file; try { file = await readFile(candidate); } catch { file = await readFile(join(dist, 'index.html')); } res.writeHead(200, { 'content-type': mime[extname(candidate)] || 'application/octet-stream' }); if (req.method !== 'HEAD') res.end(file); else res.end();
+} catch (error) { json(res, 500, { error: error instanceof Error ? error.message : 'Internal server error' }); } }).listen(port, () => console.log(`AgentForge listening on :${port}`));
