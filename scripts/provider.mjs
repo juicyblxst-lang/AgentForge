@@ -98,6 +98,77 @@ function isJsonRpcBinding(service) {
   return /jsonrpc/i.test(String(service.protocolBinding || ""));
 }
 
+function declaredSkills(service) {
+  const skills = service?.agentCard?.skills;
+  return Array.isArray(skills) ? skills : [];
+}
+
+function findFundedJobSkill(service) {
+  return declaredSkills(service).find((skill) => {
+    const id = String(skill?.id || skill?.name || skill?.skill || "").trim().toLowerCase();
+    return id === "notify_funded" || id === "notify-funded" || /notify.*funded/.test(id);
+  }) || null;
+}
+
+function buildA2AFundedJobMessage(job, service, messageId) {
+  const skill = findFundedJobSkill(service);
+  if (!skill) return null;
+
+  // A2A agents may advertise a funded-job callback as a skill rather than a
+  // free-form text task. The skill envelope is part of the agent's declared
+  // protocol contract and must be sent as a data part.
+  const data = { skill: String(skill.id || skill.name || "notify_funded"), job_id: Number(job.id) };
+  const v1 = isV1(service);
+  const jsonRpc = isJsonRpcBinding(service) || !service.protocolBinding;
+
+  if (v1 && jsonRpc) {
+    return {
+      body: {
+        jsonrpc: "2.0",
+        id: messageId,
+        method: "SendMessage",
+        params: {
+          message: {
+            messageId,
+            role: "ROLE_USER",
+            parts: [{ data }],
+          },
+        },
+      },
+      headers: { "A2A-Version": "1.0" },
+    };
+  }
+
+  if (v1 && !jsonRpc) {
+    return {
+      body: {
+        message: {
+          messageId,
+          role: "user",
+          parts: [{ kind: "data", data }],
+        },
+      },
+      headers: { "A2A-Version": "1.0" },
+    };
+  }
+
+  return {
+    body: {
+      jsonrpc: "2.0",
+      id: messageId,
+      method: "message/send",
+      params: {
+        message: {
+          messageId,
+          role: "user",
+          parts: [{ kind: "data", data }],
+        },
+      },
+    },
+    headers: {},
+  };
+}
+
 async function executeSelectedAgent(job, service) {
   const messageId = `${job.id.toString()}-${Date.now()}`;
   const v1 = isV1(service);
@@ -113,7 +184,11 @@ async function executeSelectedAgent(job, service) {
   let headers = { "content-type": v1 ? "application/a2a+json" : "application/json", accept: "application/json" };
 
   if (isA2A) {
-    if (v1 && jsonRpc) {
+    const fundedSkillMessage = buildA2AFundedJobMessage(job, service, messageId);
+    if (fundedSkillMessage) {
+      body = fundedSkillMessage.body;
+      headers = { ...headers, ...fundedSkillMessage.headers };
+    } else if (v1 && jsonRpc) {
       body = {
         jsonrpc: "2.0",
         id: messageId,
@@ -161,6 +236,7 @@ async function executeSelectedAgent(job, service) {
   }
 
   console.log(`[provider] invoking ${service.protocol} ${service.protocolVersion || service.version || "unknown"} ${service.protocolBinding || "default"} service ${service.serviceName} at ${service.endpoint}`);
+  console.log(`[provider] A2A request shape=${isA2A ? (findFundedJobSkill(service) ? "declared-funded-skill" : "generic-task") : "custom"}`);
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), Number(process.env.ERC8183_AGENT_TIMEOUT_MS || 120000));
   try {
