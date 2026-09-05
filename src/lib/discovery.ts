@@ -62,13 +62,27 @@ async function resolveCapabilities(agentURI?: string, agentId?: string, chainId 
   } catch { return null; }
 }
 
+function dedupeAgents(agents: MarketplaceAgent[]): MarketplaceAgent[] {
+  const seen = new Set<string>();
+  return agents.filter(agent => {
+    const agentId = String(agent.agentId || '').trim();
+    const wallet = String(agent.agentWallet || '').trim().toLowerCase();
+    const uri = String(agent.agentURI || '').trim().toLowerCase();
+    const endpoint = String(agent.a2aEndpoint || agent.mcpEndpoint || '').trim().toLowerCase();
+    const identity = agentId || wallet || uri || endpoint || `${agent.name.trim().toLowerCase()}|${agent.chainId}`;
+    if (seen.has(identity)) return false;
+    seen.add(identity);
+    return true;
+  });
+}
+
 export async function discoverBscAgents(first = 500, skip = 0): Promise<MarketplaceAgent[]> {
   const params = new URLSearchParams({ first: String(Math.min(Math.max(first, 1), 500)), skip: String(Math.max(skip, 0)), chainId: '97', servicesOnly: 'true' });
   const response = await fetch(`/api/agents?${params.toString()}`);
   if (!response.ok) throw new Error(`Agent discovery failed (${response.status})`);
   const data = await response.json() as { agents?: any[]; error?: string };
   if (data.error) throw new Error(data.error);
-  return Promise.all((data.agents ?? []).filter(a => Number(a.chainId) === 97).map(async a => {
+  const agents = await Promise.all((data.agents ?? []).filter(a => Number(a.chainId) === 97).map(async a => {
     const rf = a.registrationFile ?? {};
     const resolved = await resolveCapabilities(a.agentURI, String(a.agentId), 97);
     const capabilities = [...new Set([...collectCapabilities(rf), ...(Array.isArray(resolved?.capabilities) ? resolved.capabilities : [])])];
@@ -83,4 +97,5 @@ export async function discoverBscAgents(first = 500, skip = 0): Promise<Marketpl
       capabilitiesVerified: Boolean(resolved?.verified), capabilitiesSource: resolved?.source ?? 'none', active: rf.active,
     };
   }));
+  return dedupeAgents(agents);
 }
