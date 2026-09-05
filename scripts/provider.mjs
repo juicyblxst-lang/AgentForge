@@ -215,7 +215,7 @@ async function submitExecution(job, execution) {
   return result;
 }
 
-async function processFundedJob(job) {
+async function processFundedJob(job, requestedAgentId = null) {
   const key = job.id.toString();
   if (executing.has(key)) return { accepted: false, reason: "already executing" };
   if (terminalFailures.has(key)) return { accepted: false, reason: "terminal failure" };
@@ -224,7 +224,7 @@ async function processFundedJob(job) {
   executing.add(key);
   try {
     console.log(`[provider] executing funded job #${key}: ${job.description}`);
-    const execution = await executeDynamicAgent(job);
+    const execution = await executeDynamicAgent(job, requestedAgentId);
     console.log(`[provider] agent #${key} returned: ${execution.agentResult.text.slice(0, 1000)}`);
     const result = await submitExecution(job, execution);
     console.log(`[provider] submitted #${key}: ${result.txHash}`);
@@ -260,9 +260,9 @@ const httpServer = createServer(async (req, res) => {
       const job = await client.getJob(BigInt(jobId));
       if (job.provider.toLowerCase() !== jobOps.agentAddress.toLowerCase()) { sendJson(res, 403, { error: "Job provider does not match AgentForge provider" }); return; }
       if (job.status !== 1) { sendJson(res, 409, { error: `Job #${jobId} is not Funded`, status: Number(job.status) }); return; }
-      const execution = await executeDynamicAgent(job, body.agentId ?? null);
-      const result = await submitExecution(job, execution);
-      sendJson(res, 200, { status: "submitted", jobId, txHash: result.txHash, route: execution.route, service: execution.service, result: execution.agentResult });
+      const processed = await processFundedJob(job, body.agentId ?? null);
+      if (!processed.accepted) { sendJson(res, 409, { error: `Job #${jobId} is already being executed`, reason: processed.reason }); return; }
+      sendJson(res, 200, { status: "submitted", jobId, txHash: processed.result.txHash, route: processed.execution.route, service: processed.execution.service, result: processed.execution.agentResult });
       return;
     }
     sendJson(res, 404, { error: "Not found" });
