@@ -3,7 +3,7 @@ import { EVMWalletProvider, ERC8183Client, loadEnv } from "@bnbagent/sdk";
 import { ERC8183JobOps } from "@bnbagent/sdk/erc8183";
 import { LocalStorageProvider } from "@bnbagent/sdk/storage";
 import { resolveAgentService, extractAgentRoute } from "./erc8004-agent.mjs";
-import { persistExecution, getPersistedExecution } from "./execution-persistence.mjs";
+import { persistExecution, getPersistedExecution, acquireWorkerLease } from "./execution-persistence.mjs";
 
 loadEnv();
 
@@ -41,243 +41,59 @@ const terminalFailures = new Set();
 const retryState = new Map();
 const executing = new Set();
 let polling = false;
-
-// All provider-wallet writes go through this lane. The SDK owns nonce selection,
-// but two concurrent writes from the same signer can still race at the RPC
-// boundary. Serialising writes here is the provider's single-writer invariant.
+let leaseUnavailableLogged = false;
 let txLane = Promise.resolve();
-function providerTx(operation) {
-  const run = txLane.then(operation, operation);
-  txLane = run.catch(() => undefined);
-  return run;
-}
+function providerTx(operation) { const run = txLane.then(operation, operation); txLane = run.catch(() => undefined); return run; }
 
-function sendJson(res, statusCode, body) {
-  res.writeHead(statusCode, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
-  res.end(JSON.stringify(body));
-}
-
-async function readJson(req) {
-  let raw = "";
-  for await (const chunk of req) raw += chunk;
-  if (!raw.trim()) return {};
-  try { return JSON.parse(raw); } catch { throw new Error("Request body must be valid JSON"); }
-}
-
-function extractAgentText(value) {
-  const parts = value?.result?.message?.parts || value?.result?.artifacts?.flatMap((artifact) => artifact.parts || []) || value?.message?.parts || value?.parts;
-  if (Array.isArray(parts)) {
-    const text = parts.map((part) => part?.text ?? part?.content ?? "").filter(Boolean).join("\n");
-    if (text) return text;
-  }
-  if (typeof value?.result?.text === "string") return value.result.text;
-  if (typeof value?.text === "string") return value.text;
-  return null;
-}
-
-function classifyExecutionError(error) {
-  const message = error instanceof Error ? error.message : String(error);
-  const status = message.match(/HTTP\s+(\d{3})/i)?.[1];
-  if ((status && /^4\d\d$/.test(status)) || /no resolvable registration file/i.test(message) || /job verification failed: job has expired/i.test(message) || /submission deadline has passed/i.test(message) || /job has expired/i.test(message)) return { terminal: true, message };
-  return { terminal: false, message };
-}
-
-function retryAllowed(key) {
-  const state = retryState.get(key) || { attempts: 0, nextAt: 0 };
-  return state.attempts < maxRetries && Date.now() >= state.nextAt;
-}
-function recordRetry(key) {
-  const state = retryState.get(key) || { attempts: 0, nextAt: 0 };
-  state.attempts += 1;
-  state.nextAt = Date.now() + Math.min(retryBackoffMs * 2 ** (state.attempts - 1), 60000);
-  retryState.set(key, state);
-  return state;
-}
+function sendJson(res, statusCode, body) { res.writeHead(statusCode, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" }); res.end(JSON.stringify(body)); }
+async function readJson(req) { let raw = ""; for await (const chunk of req) raw += chunk; if (!raw.trim()) return {}; try { return JSON.parse(raw); } catch { throw new Error("Request body must be valid JSON"); } }
+function extractAgentText(value) { const parts = value?.result?.message?.parts || value?.result?.artifacts?.flatMap((artifact) => artifact.parts || []) || value?.message?.parts || value?.parts; if (Array.isArray(parts)) { const text = parts.map((part) => part?.text ?? part?.content ?? "").filter(Boolean).join("\n"); if (text) return text; } if (typeof value?.result?.text === "string") return value.result.text; if (typeof value?.text === "string") return value.text; return null; }
+function classifyExecutionError(error) { const message = error instanceof Error ? error.message : String(error); const status = message.match(/HTTP\s+(\d{3})/i)?.[1]; if ((status && /^4\d\d$/.test(status)) || /no resolvable registration file/i.test(message) || /job verification failed: job has expired/i.test(message) || /submission deadline has passed/i.test(message) || /job has expired/i.test(message)) return { terminal: true, message }; return { terminal: false, message }; }
+function retryAllowed(key) { const state = retryState.get(key) || { attempts: 0, nextAt: 0 }; return state.attempts < maxRetries && Date.now() >= state.nextAt; }
+function recordRetry(key) { const state = retryState.get(key) || { attempts: 0, nextAt: 0 }; state.attempts += 1; state.nextAt = Date.now() + Math.min(retryBackoffMs * 2 ** (state.attempts - 1), 60000); retryState.set(key, state); return state; }
 function isV1(service) { const version = String(service.protocolVersion || service.version || ""); return /^1(?:\.0)?(?:\.|$)/.test(version); }
 function isJsonRpcBinding(service) { return /jsonrpc/i.test(String(service.protocolBinding || "")); }
 function declaredSkills(service) { const skills = service?.agentCard?.skills; return Array.isArray(skills) ? skills : []; }
-function findFundedJobSkill(service) {
-  return declaredSkills(service).find((skill) => {
-    const id = String(skill?.id || skill?.name || skill?.skill || "").trim().toLowerCase();
-    return id === "notify_funded" || id === "notify-funded" || /notify.*funded/.test(id);
-  }) || null;
-}
-function buildA2AFundedJobMessage(job, service, messageId) {
-  const skill = findFundedJobSkill(service);
-  if (!skill) return null;
-  const data = { skill: String(skill.id || skill.name || "notify_funded"), job_id: Number(job.id) };
-  const v1 = isV1(service);
-  const jsonRpc = isJsonRpcBinding(service) || !service.protocolBinding;
-  if (v1 && jsonRpc) return { body: { jsonrpc: "2.0", id: messageId, method: "SendMessage", params: { message: { messageId, role: "ROLE_USER", parts: [{ data }] } } }, headers: { "A2A-Version": "1.0" } };
-  if (v1 && !jsonRpc) return { body: { message: { messageId, role: "user", parts: [{ kind: "data", data }] } }, headers: { "A2A-Version": "1.0" } };
-  return { body: { jsonrpc: "2.0", id: messageId, method: "message/send", params: { message: { messageId, role: "user", parts: [{ kind: "data", data }] } } }, headers: {} };
-}
+function findFundedJobSkill(service) { return declaredSkills(service).find((skill) => { const id = String(skill?.id || skill?.name || skill?.skill || "").trim().toLowerCase(); return id === "notify_funded" || id === "notify-funded" || /notify.*funded/.test(id); }) || null; }
+function buildA2AFundedJobMessage(job, service, messageId) { const skill = findFundedJobSkill(service); if (!skill) return null; const data = { skill: String(skill.id || skill.name || "notify_funded"), job_id: Number(job.id) }; const v1 = isV1(service); const jsonRpc = isJsonRpcBinding(service) || !service.protocolBinding; if (v1 && jsonRpc) return { body: { jsonrpc: "2.0", id: messageId, method: "SendMessage", params: { message: { messageId, role: "ROLE_USER", parts: [{ data }] } } }, headers: { "A2A-Version": "1.0" } }; if (v1 && !jsonRpc) return { body: { message: { messageId, role: "user", parts: [{ kind: "data", data }] } }, headers: { "A2A-Version": "1.0" } }; return { body: { jsonrpc: "2.0", id: messageId, method: "message/send", params: { message: { messageId, role: "user", parts: [{ kind: "data", data }] } } }, headers: {} }; }
 
 async function executeSelectedAgent(job, service) {
-  const messageId = `${job.id.toString()}-${Date.now()}`;
-  const v1 = isV1(service);
-  const jsonRpc = isJsonRpcBinding(service) || !service.protocolBinding;
-  const isA2A = service.protocol === "a2a";
-  const isERC8183 = service.protocol === "erc-8183" || (service.protocol === "custom" && /erc.?8183/i.test(`${service.serviceName} ${service.endpoint}`));
+  const messageId = `${job.id.toString()}-${Date.now()}`; const v1 = isV1(service); const jsonRpc = isJsonRpcBinding(service) || !service.protocolBinding; const isA2A = service.protocol === "a2a"; const isERC8183 = service.protocol === "erc-8183" || (service.protocol === "custom" && /erc.?8183/i.test(`${service.serviceName} ${service.endpoint}`));
   if (isERC8183 && !isA2A) throw new Error(`ERC-8183 service ${service.serviceName} is advertised as a service endpoint, but AgentForge does not infer a non-standard request schema from ERC-8004 metadata`);
-
-  let body;
-  let headers = { "content-type": v1 ? "application/a2a+json" : "application/json", accept: "application/json" };
-  if (isA2A) {
-    const fundedSkillMessage = buildA2AFundedJobMessage(job, service, messageId);
-    if (fundedSkillMessage) { body = fundedSkillMessage.body; headers = { ...headers, ...fundedSkillMessage.headers }; }
-    else if (v1 && jsonRpc) { body = { jsonrpc: "2.0", id: messageId, method: "SendMessage", params: { message: { messageId, role: "ROLE_USER", parts: [{ text: { text: job.description } }] } } }; headers = { ...headers, "A2A-Version": "1.0" }; }
-    else if (v1 && !jsonRpc) { body = { message: { messageId, role: "user", parts: [{ kind: "text", text: job.description }] } }; headers = { ...headers, "A2A-Version": "1.0" }; }
-    else { body = { jsonrpc: "2.0", id: messageId, method: "message/send", params: { message: { messageId, role: "user", parts: [{ kind: "text", text: job.description }] } } }; }
-  } else {
-    body = { jobId: Number(job.id), agentId: Number(service.agentId), chainId: Number(service.chainId), task: job.description, protocol: "custom" };
-  }
-
-  console.log(`[provider] invoking ${service.protocol} ${service.protocolVersion || service.version || "unknown"} ${service.protocolBinding || "default"} service ${service.serviceName} at ${service.endpoint}`);
-  console.log(`[provider] A2A request shape=${isA2A ? (findFundedJobSkill(service) ? "declared-funded-skill" : "generic-task") : "custom"}`);
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), Number(process.env.ERC8183_AGENT_TIMEOUT_MS || 120000));
-  try {
-    const response = await fetch(service.endpoint, { method: "POST", headers, body: JSON.stringify(body), signal: controller.signal });
-    const raw = await response.text();
-    let parsed = null; try { parsed = raw ? JSON.parse(raw) : null; } catch {}
-    if (!response.ok) throw new Error(`Agent service ${service.serviceName} returned HTTP ${response.status}: ${raw.slice(0, 500)}`);
-    if (parsed?.error) throw new Error(`Agent endpoint returned JSON-RPC error: ${JSON.stringify(parsed.error)}`);
-    const text = extractAgentText(parsed);
-    if (!text && !raw) throw new Error("Agent endpoint returned an empty response");
-    return { protocol: service.protocol, protocolVersion: service.protocolVersion || service.version || null, protocolBinding: service.protocolBinding || null, serviceName: service.serviceName, endpoint: service.endpoint, registrationEndpoint: service.registrationEndpoint, request: body, response: parsed ?? raw, text: text ?? raw, receivedAt: new Date().toISOString() };
-  } finally { clearTimeout(timeout); }
+  let body; let headers = { "content-type": v1 ? "application/a2a+json" : "application/json", accept: "application/json" };
+  if (isA2A) { const fundedSkillMessage = buildA2AFundedJobMessage(job, service, messageId); if (fundedSkillMessage) { body = fundedSkillMessage.body; headers = { ...headers, ...fundedSkillMessage.headers }; } else if (v1 && jsonRpc) { body = { jsonrpc: "2.0", id: messageId, method: "SendMessage", params: { message: { messageId, role: "ROLE_USER", parts: [{ text: { text: job.description } }] } } }; headers = { ...headers, "A2A-Version": "1.0" }; } else if (v1 && !jsonRpc) { body = { message: { messageId, role: "user", parts: [{ kind: "text", text: job.description }] } }; headers = { ...headers, "A2A-Version": "1.0" }; } else { body = { jsonrpc: "2.0", id: messageId, method: "message/send", params: { message: { messageId, role: "user", parts: [{ kind: "text", text: job.description }] } } }; } }
+  else body = { jobId: Number(job.id), agentId: Number(service.agentId), chainId: Number(service.chainId), task: job.description, protocol: "custom" };
+  console.log(`[provider] invoking ${service.protocol} ${service.protocolVersion || service.version || "unknown"} ${service.protocolBinding || "default"} service ${service.serviceName} at ${service.endpoint}`); console.log(`[provider] A2A request shape=${isA2A ? (findFundedJobSkill(service) ? "declared-funded-skill" : "generic-task") : "custom"}`);
+  const controller = new AbortController(); const timeout = setTimeout(() => controller.abort(), Number(process.env.ERC8183_AGENT_TIMEOUT_MS || 120000));
+  try { const response = await fetch(service.endpoint, { method: "POST", headers, body: JSON.stringify(body), signal: controller.signal }); const raw = await response.text(); let parsed = null; try { parsed = raw ? JSON.parse(raw) : null; } catch {} if (!response.ok) throw new Error(`Agent service ${service.serviceName} returned HTTP ${response.status}: ${raw.slice(0, 500)}`); if (parsed?.error) throw new Error(`Agent endpoint returned JSON-RPC error: ${JSON.stringify(parsed.error)}`); const text = extractAgentText(parsed); if (!text && !raw) throw new Error("Agent endpoint returned an empty response"); return { protocol: service.protocol, protocolVersion: service.protocolVersion || service.version || null, protocolBinding: service.protocolBinding || null, serviceName: service.serviceName, endpoint: service.endpoint, registrationEndpoint: service.registrationEndpoint, request: body, response: parsed ?? raw, text: text ?? raw, receivedAt: new Date().toISOString() }; }
+  finally { clearTimeout(timeout); }
 }
 
-async function executeDynamicAgent(job) {
-  const route = extractAgentRoute(job.description);
-  if (!route?.agentId) throw new Error(`No ERC-8004 agent route found in job #${job.id}`);
-  const service = await resolveAgentService(route.agentId, route.chainId);
-  console.log(`[provider] resolved ERC-8004 #${route.agentId} ${service.serviceName} ${service.endpoint} (${service.protocolVersion || "unknown"})`);
-  return { route: { agentId: String(route.agentId), chainId: Number(route.chainId), source: "erc8004-job-description" }, service, agentResult: await executeSelectedAgent(job, service) };
+async function executeDynamicAgent(job) { const route = extractAgentRoute(job.description); if (!route?.agentId) throw new Error(`No ERC-8004 agent route found in job #${job.id}`); const service = await resolveAgentService(route.agentId, route.chainId); console.log(`[provider] resolved ERC-8004 #${route.agentId} ${service.serviceName} ${service.endpoint} (${service.protocolVersion || "unknown"})`); return { route: { agentId: String(route.agentId), chainId: Number(route.chainId), source: "erc8004-job-description" }, service, agentResult: await executeSelectedAgent(job, service) }; }
+async function submitExecution(job, execution) { const deliverable = JSON.stringify({ status: "completed", jobId: Number(job.id), provider: jobOps.agentAddress, description: job.description, executedByAgent: true, routing: execution.route, service: { name: execution.service.serviceName, endpoint: execution.service.endpoint, protocol: execution.service.protocol, protocolVersion: execution.service.protocolVersion || null, protocolBinding: execution.service.protocolBinding || null }, agentResult: execution.agentResult, processedAt: new Date().toISOString() }); const result = await providerTx(() => jobOps.submitResult(Number(job.id), deliverable, { agentforge: true, worker: "agentforge-provider-v6", executedAgent: true, routing: "erc8004-registration" })); if (!result.success) throw new Error(result.error || "ERC-8183 result submission failed"); return { result, deliverable }; }
+async function reconcileJob(job) { const status = Number(job.status); const route = extractAgentRoute(job.description); if (!route?.agentId) return; let service; try { service = await resolveAgentService(route.agentId, route.chainId); } catch (error) { console.error(`[provider] reconciliation route lookup failed for #${job.id}:`, error instanceof Error ? error.message : error); return; } const lifecycle = { 0: "CREATED", 1: "FUNDED", 2: "SUBMITTED", 3: "SETTLED", 4: "FAILED", 5: "FAILED" }[status]; if (!lifecycle) return; try { await persistExecution({ job, agentId: route.agentId, agentName: service.serviceName, status: lifecycle, settledAt: status === 3 ? new Date().toISOString() : null }); } catch (error) { console.error(`[provider] persistence reconciliation failed for #${job.id}:`, error instanceof Error ? error.message : error); } }
+async function processFundedJob(job) { const key = job.id.toString(); if (executing.has(key)) return { accepted: false, reason: "already executing" }; if (terminalFailures.has(key)) return { accepted: false, reason: "terminal failure" }; if (job.provider.toLowerCase() !== jobOps.agentAddress.toLowerCase()) throw new Error("Job provider does not match AgentForge provider"); if (job.status !== 1) throw new Error(`Job #${key} is not Funded`); try { const persisted = await getPersistedExecution(key); if (persisted && ["SUBMITTED", "SETTLED", "VERIFIED", "FAILED"].includes(String(persisted.status).toUpperCase())) return { accepted: false, reason: "already persisted terminal lifecycle" }; } catch (error) { console.error(`[provider] persistence guard lookup failed for #${key}:`, error instanceof Error ? error.message : error); }
+  executing.add(key); try { console.log(`[provider] executing funded job #${key}: ${job.description}`); const execution = await executeDynamicAgent(job); await persistExecution({ job, agentId: execution.route.agentId, agentName: execution.service.serviceName, status: "FUNDED" }); console.log(`[provider] agent #${key} returned: ${execution.agentResult.text.slice(0, 1000)}`); const submitted = await submitExecution(job, execution); await persistExecution({ job, agentId: execution.route.agentId, agentName: execution.service.serviceName, status: "SUBMITTED", deliverable: submitted.deliverable, submittedAt: new Date().toISOString() }); console.log(`[provider] submitted #${key}: ${submitted.result.txHash}`); funded.delete(key); retryState.delete(key); return { accepted: true, result: submitted.result, execution }; }
+  catch (error) { const classification = classifyExecutionError(error); const message = classification.message; if (classification.terminal) { terminalFailures.add(key); funded.delete(key); retryState.delete(key); console.error(`[provider] terminal agent failure for #${key}: ${message}`); } else { const retry = recordRetry(key); if (retry.attempts >= maxRetries) { terminalFailures.add(key); funded.delete(key); console.error(`[provider] retry limit reached for #${key}: ${message}`); } else console.error(`[provider] funded job #${key} transient failure; retry ${retry.attempts}: ${message}`); } throw error; }
+  finally { executing.delete(key); }
 }
 
-async function submitExecution(job, execution) {
-  const deliverable = JSON.stringify({ status: "completed", jobId: Number(job.id), provider: jobOps.agentAddress, description: job.description, executedByAgent: true, routing: execution.route, service: { name: execution.service.serviceName, endpoint: execution.service.endpoint, protocol: execution.service.protocol, protocolVersion: execution.service.protocolVersion || null, protocolBinding: execution.service.protocolBinding || null }, agentResult: execution.agentResult, processedAt: new Date().toISOString() });
-  const result = await providerTx(() => jobOps.submitResult(Number(job.id), deliverable, { agentforge: true, worker: "agentforge-provider-v6", executedAgent: true, routing: "erc8004-registration" }));
-  if (!result.success) throw new Error(result.error || "ERC-8183 result submission failed");
-  return { result, deliverable };
-}
-
-async function reconcileJob(job) {
-  const status = Number(job.status);
-  const route = extractAgentRoute(job.description);
-  if (!route?.agentId) return;
-  let service;
-  try { service = await resolveAgentService(route.agentId, route.chainId); } catch (error) { console.error(`[provider] reconciliation route lookup failed for #${job.id}:`, error instanceof Error ? error.message : error); return; }
-  const lifecycle = { 0: "CREATED", 1: "FUNDED", 2: "SUBMITTED", 3: "SETTLED", 4: "FAILED", 5: "FAILED" }[status];
-  if (!lifecycle) return;
-  try { await persistExecution({ job, agentId: route.agentId, agentName: service.serviceName, status: lifecycle, settledAt: status === 3 ? new Date().toISOString() : null }); }
-  catch (error) { console.error(`[provider] persistence reconciliation failed for #${job.id}:`, error instanceof Error ? error.message : error); }
-}
-
-async function processFundedJob(job) {
-  const key = job.id.toString();
-  if (executing.has(key)) return { accepted: false, reason: "already executing" };
-  if (terminalFailures.has(key)) return { accepted: false, reason: "terminal failure" };
-  if (job.provider.toLowerCase() !== jobOps.agentAddress.toLowerCase()) throw new Error("Job provider does not match AgentForge provider");
-  if (job.status !== 1) throw new Error(`Job #${key} is not Funded`);
-  try { const persisted = await getPersistedExecution(key); if (persisted && ["SUBMITTED", "SETTLED", "VERIFIED", "FAILED"].includes(String(persisted.status).toUpperCase())) return { accepted: false, reason: "already persisted terminal lifecycle" }; }
-  catch (error) { console.error(`[provider] persistence guard lookup failed for #${key}:`, error instanceof Error ? error.message : error); }
-  executing.add(key);
-  try {
-    console.log(`[provider] executing funded job #${key}: ${job.description}`);
-    const execution = await executeDynamicAgent(job);
-    await persistExecution({ job, agentId: execution.route.agentId, agentName: execution.service.serviceName, status: "FUNDED" });
-    console.log(`[provider] agent #${key} returned: ${execution.agentResult.text.slice(0, 1000)}`);
-    const submitted = await submitExecution(job, execution);
-    await persistExecution({ job, agentId: execution.route.agentId, agentName: execution.service.serviceName, status: "SUBMITTED", deliverable: submitted.deliverable, submittedAt: new Date().toISOString() });
-    console.log(`[provider] submitted #${key}: ${submitted.result.txHash}`);
-    funded.delete(key); retryState.delete(key);
-    return { accepted: true, result: submitted.result, execution };
-  } catch (error) {
-    const classification = classifyExecutionError(error);
-    const message = classification.message;
-    if (classification.terminal) { terminalFailures.add(key); funded.delete(key); retryState.delete(key); console.error(`[provider] terminal agent failure for #${key}: ${message}`); }
-    else { const retry = recordRetry(key); if (retry.attempts >= maxRetries) { terminalFailures.add(key); funded.delete(key); console.error(`[provider] retry limit reached for #${key}: ${message}`); } else console.error(`[provider] funded job #${key} transient failure; retry ${retry.attempts}: ${message}`); }
-    throw error;
-  } finally { executing.delete(key); }
-}
-
-const httpServer = createServer(async (req, res) => {
-  try {
-    if (req.method === "GET" && req.url === "/status") { sendJson(res, 200, { status: "ok", service: "agentforge-provider", network, chainId: 97, agentWallet: jobOps.agentAddress, servicePrice: servicePrice.toString(), executionEndpoint, routing: "dynamic-erc8004" }); return; }
-    if (req.method === "GET" && req.url === "/health") { sendJson(res, 200, { status: "ok", service: "agentforge-provider" }); return; }
-    if (req.url === "/erc8183") {
-      if (req.method !== "POST") { res.setHeader("Allow", "POST"); sendJson(res, 405, { error: "Method Not Allowed", endpoint: "/erc8183", method: "POST" }); return; }
-      const body = await readJson(req); const jobId = Number(body.jobId);
-      if (!Number.isInteger(jobId) || jobId <= 0) { sendJson(res, 400, { error: "jobId must be a positive integer" }); return; }
-      const job = await client.getJob(BigInt(jobId));
-      if (job.provider.toLowerCase() !== jobOps.agentAddress.toLowerCase()) { sendJson(res, 403, { error: "Job provider does not match AgentForge provider" }); return; }
-      if (job.status !== 1) { sendJson(res, 409, { error: `Job #${jobId} is not Funded`, status: Number(job.status) }); return; }
-      const processed = await processFundedJob(job);
-      if (!processed.accepted) { if (processed.reason === "already executing") sendJson(res, 202, { status: "processing", jobId, reason: processed.reason }); else sendJson(res, 409, { error: `Job #${jobId} cannot be processed`, reason: processed.reason }); return; }
-      sendJson(res, 200, { status: "submitted", jobId, txHash: processed.result.txHash, route: processed.execution.route, service: processed.execution.service, result: processed.execution.agentResult }); return;
-    }
-    sendJson(res, 404, { error: "Not found" });
-  } catch (error) { const message = error instanceof Error ? error.message : String(error); console.error(`[provider] HTTP execution error: ${message}`); sendJson(res, 502, { error: message }); }
-});
-
+const httpServer = createServer(async (req, res) => { try { if (req.method === "GET" && req.url === "/status") { sendJson(res, 200, { status: "ok", service: "agentforge-provider", network, chainId: 97, agentWallet: jobOps.agentAddress, servicePrice: servicePrice.toString(), executionEndpoint, routing: "dynamic-erc8004" }); return; } if (req.method === "GET" && req.url === "/health") { sendJson(res, 200, { status: "ok", service: "agentforge-provider" }); return; } if (req.url === "/erc8183") { if (req.method !== "POST") { res.setHeader("Allow", "POST"); sendJson(res, 405, { error: "Method Not Allowed", endpoint: "/erc8183", method: "POST" }); return; } const body = await readJson(req); const jobId = Number(body.jobId); if (!Number.isInteger(jobId) || jobId <= 0) { sendJson(res, 400, { error: "jobId must be a positive integer" }); return; } const job = await client.getJob(BigInt(jobId)); if (job.provider.toLowerCase() !== jobOps.agentAddress.toLowerCase()) { sendJson(res, 403, { error: "Job provider does not match AgentForge provider" }); return; } if (job.status !== 1) { sendJson(res, 409, { error: `Job #${jobId} is not Funded`, status: Number(job.status) }); return; } const processed = await processFundedJob(job); if (!processed.accepted) { if (processed.reason === "already executing") sendJson(res, 202, { status: "processing", jobId, reason: processed.reason }); else sendJson(res, 409, { error: `Job #${jobId} cannot be processed`, reason: processed.reason }); return; } sendJson(res, 200, { status: "submitted", jobId, txHash: processed.result.txHash, route: processed.execution.route, service: processed.execution.service, result: processed.execution.agentResult }); return; } sendJson(res, 404, { error: "Not found" }); } catch (error) { const message = error instanceof Error ? error.message : String(error); console.error(`[provider] HTTP execution error: ${message}`); sendJson(res, 502, { error: message }); } });
 httpServer.listen(port, () => console.log(`[provider] HTTP server listening on :${port}; execution endpoint=${executionEndpoint}`));
-
-async function readJobs(jobIds) {
-  const jobs = [];
-  for (let start = 0; start < jobIds.length; start += batchSize) {
-    const results = await client.commerce.getJobsBatch(jobIds.slice(start, start + batchSize));
-    for (const job of results) if (job) jobs.push(job);
-  }
-  return jobs;
-}
-
+async function readJobs(jobIds) { const jobs = []; for (let start = 0; start < jobIds.length; start += batchSize) { const results = await client.commerce.getJobsBatch(jobIds.slice(start, start + batchSize)); for (const job of results) if (job) jobs.push(job); } return jobs; }
 async function pollJobs() {
-  if (polling) return;
-  polling = true;
+  if (polling) return; polling = true;
   try {
-    const counter = await client.commerce.jobCounter();
-    const recentJobIds = [];
-    const firstId = counter > BigInt(batchSize - 1) ? counter - BigInt(batchSize - 1) : 1n;
-    for (let id = firstId; id <= counter; id += 1n) recentJobIds.push(id);
-    for (const job of await readJobs(recentJobIds)) {
-      const key = job.id.toString();
-      if (job.provider.toLowerCase() !== jobOps.agentAddress.toLowerCase() || terminalFailures.has(key)) continue;
-      await reconcileJob(job);
-      if (job.status === 0) open.add(key);
-      if (job.status === 1) funded.add(key);
-    }
-    const tracked = new Set([...open, ...budgeted, ...funded]);
-    const openIds = new Set(); const fundedIds = new Set();
-    for (const key of tracked) {
-      try {
-        const job = await client.getJob(BigInt(key));
-        if (job.provider.toLowerCase() !== jobOps.agentAddress.toLowerCase() || terminalFailures.has(key)) { open.delete(key); budgeted.delete(key); funded.delete(key); continue; }
-        await reconcileJob(job);
-        if (job.status === 0) openIds.add(key); else if (job.status === 1) fundedIds.add(key); else { open.delete(key); budgeted.delete(key); funded.delete(key); }
-      } catch (error) { console.error(`[provider] getJob(${key}) failed:`, error instanceof Error ? error.message : error); }
-    }
-    for (const key of openIds) {
-      if (budgeted.has(key)) continue;
-      try { const result = await providerTx(() => client.setBudget(BigInt(key), servicePrice)); console.log(`[provider] set budget for #${key}: ${result.txHash || result.transactionHash || "submitted"}`); budgeted.add(key); open.delete(key); }
-      catch (error) { console.error(`[provider] setBudget failed for #${key}:`, error instanceof Error ? error.message : error); }
-    }
-    for (const key of fundedIds) {
-      if (terminalFailures.has(key) || !retryAllowed(key) || executing.has(key)) continue;
-      try { const job = await client.getJob(BigInt(key)); if (job.status !== 1) { funded.delete(key); continue; } void processFundedJob(job).catch((error) => console.error(`[provider] funded job #${key} execution cycle ended:`, error instanceof Error ? error.message : error)); }
-      catch (error) { console.error(`[provider] funded job #${key} dispatch failed:`, error instanceof Error ? error.message : error); }
-    }
+    const hasLease = await acquireWorkerLease(120);
+    if (!hasLease) { if (!leaseUnavailableLogged) { console.log("[provider] another provider instance owns the worker lease; polling skipped"); leaseUnavailableLogged = true; } return; }
+    leaseUnavailableLogged = false;
+    const counter = await client.commerce.jobCounter(); const recentJobIds = []; const firstId = counter > BigInt(batchSize - 1) ? counter - BigInt(batchSize - 1) : 1n; for (let id = firstId; id <= counter; id += 1n) recentJobIds.push(id);
+    for (const job of await readJobs(recentJobIds)) { const key = job.id.toString(); if (job.provider.toLowerCase() !== jobOps.agentAddress.toLowerCase() || terminalFailures.has(key)) continue; await reconcileJob(job); if (job.status === 0) open.add(key); if (job.status === 1) funded.add(key); }
+    const tracked = new Set([...open, ...budgeted, ...funded]); const openIds = new Set(); const fundedIds = new Set();
+    for (const key of tracked) { try { const job = await client.getJob(BigInt(key)); if (job.provider.toLowerCase() !== jobOps.agentAddress.toLowerCase() || terminalFailures.has(key)) { open.delete(key); budgeted.delete(key); funded.delete(key); continue; } await reconcileJob(job); if (job.status === 0) openIds.add(key); else if (job.status === 1) fundedIds.add(key); else { open.delete(key); budgeted.delete(key); funded.delete(key); } } catch (error) { console.error(`[provider] getJob(${key}) failed:`, error instanceof Error ? error.message : error); } }
+    for (const key of openIds) { if (budgeted.has(key)) continue; try { const result = await providerTx(() => client.setBudget(BigInt(key), servicePrice)); console.log(`[provider] set budget for #${key}: ${result.txHash || result.transactionHash || "submitted"}`); budgeted.add(key); open.delete(key); } catch (error) { console.error(`[provider] setBudget failed for #${key}:`, error instanceof Error ? error.message : error); } }
+    for (const key of fundedIds) { if (terminalFailures.has(key) || !retryAllowed(key) || executing.has(key)) continue; try { const job = await client.getJob(BigInt(key)); if (job.status !== 1) { funded.delete(key); continue; } void processFundedJob(job).catch((error) => console.error(`[provider] funded job #${key} execution cycle ended:`, error instanceof Error ? error.message : error)); } catch (error) { console.error(`[provider] funded job #${key} dispatch failed:`, error instanceof Error ? error.message : error); } }
   } finally { polling = false; }
 }
 
-console.log(`[provider] address=${jobOps.agentAddress}`);
-console.log(`[provider] network=${network}`);
-console.log(`[provider] servicePrice=${servicePrice}`);
-console.log(`[provider] execution endpoint=${executionEndpoint}`);
-console.log(`[provider] routing=dynamic ERC-8004 registration via 8004scan`);
-console.log(`[provider] retry policy=max ${maxRetries}, exponential backoff`);
-console.log(`[provider] provider-wallet transaction lane=serialized`);
-await pollJobs();
-setInterval(() => void pollJobs(), pollIntervalMs);
+console.log(`[provider] address=${jobOps.agentAddress}`); console.log(`[provider] network=${network}`); console.log(`[provider] servicePrice=${servicePrice}`); console.log(`[provider] execution endpoint=${executionEndpoint}`); console.log(`[provider] routing=dynamic ERC-8004 registration via 8004scan`); console.log(`[provider] retry policy=max ${maxRetries}, exponential backoff`); console.log(`[provider] provider-wallet transaction lane=serialized + distributed lease`); await pollJobs(); setInterval(() => void pollJobs(), pollIntervalMs);
