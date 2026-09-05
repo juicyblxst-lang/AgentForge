@@ -80,9 +80,12 @@ export default async function handler(req, res) {
         return send(res, 400, { error: 'Invalid execution record' });
       }
 
+      // Job ID is unique by migration and is the canonical correlation key.
+      // This makes repeated lifecycle writes idempotent even if the client uses
+      // a different local record id for the same on-chain job.
       const { data, error } = await supabase
         .from('agentforge_executions')
-        .upsert(row, { onConflict: 'id' })
+        .upsert(row, { onConflict: 'job_id' })
         .select()
         .single();
 
