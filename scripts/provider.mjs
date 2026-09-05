@@ -3,6 +3,7 @@ import { EVMWalletProvider, ERC8183Client, loadEnv } from "@bnbagent/sdk";
 import { ERC8183JobOps } from "@bnbagent/sdk/erc8183";
 import { LocalStorageProvider } from "@bnbagent/sdk/storage";
 import { resolveAgentService, extractAgentRoute } from "./erc8004-agent.mjs";
+import { persistExecution } from "./execution-persistence.mjs";
 
 loadEnv();
 
@@ -194,8 +195,7 @@ async function executeDynamicAgent(job) {
   const agentId = route.agentId;
   const service = await resolveAgentService(agentId, route.chainId);
   console.log(`[provider] resolved ERC-8004 #${agentId} ${service.serviceName} ${service.endpoint} (${service.protocolVersion || "unknown"})`);
-  const agentResult = await executeSelectedAgent(job, service);
-  return { route: { agentId: String(agentId), chainId: Number(route.chainId), source: "erc8004-job-description" }, service, agentResult };
+  return { route: { agentId: String(agentId), chainId: Number(route.chainId), source: "erc8004-job-description" }, service, agentResult: await executeSelectedAgent(job, service) };
 }
 
 async function submitExecution(job, execution) {
@@ -212,7 +212,31 @@ async function submitExecution(job, execution) {
   });
   const result = await jobOps.submitResult(Number(job.id), deliverable, { agentforge: true, worker: "agentforge-provider-v6", executedAgent: true, routing: "erc8004-registration" });
   if (!result.success) throw new Error(result.error || "ERC-8183 result submission failed");
-  return result;
+  return { result, deliverable };
+}
+
+async function reconcileJob(job) {
+  const status = Number(job.status);
+  const route = extractAgentRoute(job.description);
+  if (!route?.agentId) return;
+  let service;
+  try { service = await resolveAgentService(route.agentId, route.chainId); } catch (error) {
+    console.error(`[provider] reconciliation route lookup failed for #${job.id}:`, error instanceof Error ? error.message : error);
+    return;
+  }
+  const lifecycle = { 0: "CREATED", 1: "FUNDED", 2: "SUBMITTED", 3: "SETTLED", 4: "FAILED", 5: "FAILED" }[status];
+  if (!lifecycle) return;
+  try {
+    await persistExecution({
+      job,
+      agentId: route.agentId,
+      agentName: service.serviceName,
+      status: lifecycle,
+      settledAt: status === 3 ? new Date().toISOString() : null,
+    });
+  } catch (error) {
+    console.error(`[provider] persistence reconciliation failed for #${job.id}:`, error instanceof Error ? error.message : error);
+  }
 }
 
 async function processFundedJob(job) {
@@ -225,11 +249,13 @@ async function processFundedJob(job) {
   try {
     console.log(`[provider] executing funded job #${key}: ${job.description}`);
     const execution = await executeDynamicAgent(job);
+    await persistExecution({ job, agentId: execution.route.agentId, agentName: execution.service.serviceName, status: "FUNDED" });
     console.log(`[provider] agent #${key} returned: ${execution.agentResult.text.slice(0, 1000)}`);
-    const result = await submitExecution(job, execution);
-    console.log(`[provider] submitted #${key}: ${result.txHash}`);
+    const submitted = await submitExecution(job, execution);
+    await persistExecution({ job, agentId: execution.route.agentId, agentName: execution.service.serviceName, status: "SUBMITTED", deliverable: submitted.deliverable, submittedAt: new Date().toISOString() });
+    console.log(`[provider] submitted #${key}: ${submitted.result.txHash}`);
     funded.delete(key); retryState.delete(key);
-    return { accepted: true, result, execution };
+    return { accepted: true, result: submitted.result, execution };
   } catch (error) {
     const classification = classifyExecutionError(error);
     const message = classification.message;
@@ -262,11 +288,8 @@ const httpServer = createServer(async (req, res) => {
       if (job.status !== 1) { sendJson(res, 409, { error: `Job #${jobId} is not Funded`, status: Number(job.status) }); return; }
       const processed = await processFundedJob(job);
       if (!processed.accepted) {
-        if (processed.reason === "already executing") {
-          sendJson(res, 202, { status: "processing", jobId, reason: processed.reason });
-        } else {
-          sendJson(res, 409, { error: `Job #${jobId} cannot be processed`, reason: processed.reason });
-        }
+        if (processed.reason === "already executing") sendJson(res, 202, { status: "processing", jobId, reason: processed.reason });
+        else sendJson(res, 409, { error: `Job #${jobId} cannot be processed`, reason: processed.reason });
         return;
       }
       sendJson(res, 200, { status: "submitted", jobId, txHash: processed.result.txHash, route: processed.execution.route, service: processed.execution.service, result: processed.execution.agentResult });
@@ -302,6 +325,7 @@ async function pollJobs() {
     for (const job of await readJobs(recentJobIds)) {
       const key = job.id.toString();
       if (job.provider.toLowerCase() !== jobOps.agentAddress.toLowerCase() || terminalFailures.has(key)) continue;
+      await reconcileJob(job);
       if (job.status === 0) open.add(key);
       if (job.status === 1) funded.add(key);
     }
@@ -312,6 +336,7 @@ async function pollJobs() {
       try {
         const job = await client.getJob(BigInt(key));
         if (job.provider.toLowerCase() !== jobOps.agentAddress.toLowerCase() || terminalFailures.has(key)) { open.delete(key); budgeted.delete(key); funded.delete(key); continue; }
+        await reconcileJob(job);
         if (job.status === 0) openIds.add(key);
         else if (job.status === 1) fundedIds.add(key);
         else { open.delete(key); budgeted.delete(key); funded.delete(key); }
