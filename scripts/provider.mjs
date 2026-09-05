@@ -3,7 +3,7 @@ import { EVMWalletProvider, ERC8183Client, loadEnv } from "@bnbagent/sdk";
 import { ERC8183JobOps } from "@bnbagent/sdk/erc8183";
 import { LocalStorageProvider } from "@bnbagent/sdk/storage";
 import { resolveAgentService, extractAgentRoute } from "./erc8004-agent.mjs";
-import { persistExecution } from "./execution-persistence.mjs";
+import { persistExecution, getPersistedExecution } from "./execution-persistence.mjs";
 
 loadEnv();
 
@@ -227,13 +227,7 @@ async function reconcileJob(job) {
   const lifecycle = { 0: "CREATED", 1: "FUNDED", 2: "SUBMITTED", 3: "SETTLED", 4: "FAILED", 5: "FAILED" }[status];
   if (!lifecycle) return;
   try {
-    await persistExecution({
-      job,
-      agentId: route.agentId,
-      agentName: service.serviceName,
-      status: lifecycle,
-      settledAt: status === 3 ? new Date().toISOString() : null,
-    });
+    await persistExecution({ job, agentId: route.agentId, agentName: service.serviceName, status: lifecycle, settledAt: status === 3 ? new Date().toISOString() : null });
   } catch (error) {
     console.error(`[provider] persistence reconciliation failed for #${job.id}:`, error instanceof Error ? error.message : error);
   }
@@ -245,6 +239,16 @@ async function processFundedJob(job) {
   if (terminalFailures.has(key)) return { accepted: false, reason: "terminal failure" };
   if (job.provider.toLowerCase() !== jobOps.agentAddress.toLowerCase()) throw new Error("Job provider does not match AgentForge provider");
   if (job.status !== 1) throw new Error(`Job #${key} is not Funded`);
+
+  try {
+    const persisted = await getPersistedExecution(key);
+    if (persisted && ["SUBMITTED", "SETTLED", "VERIFIED", "FAILED"].includes(String(persisted.status).toUpperCase())) {
+      return { accepted: false, reason: "already persisted terminal lifecycle" };
+    }
+  } catch (error) {
+    console.error(`[provider] persistence guard lookup failed for #${key}:`, error instanceof Error ? error.message : error);
+  }
+
   executing.add(key);
   try {
     console.log(`[provider] executing funded job #${key}: ${job.description}`);
