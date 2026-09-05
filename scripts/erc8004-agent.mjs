@@ -3,29 +3,49 @@ const SCAN_BASE = 'https://api.8004scan.io/api/v1';
 function debug(label, payload) { console.log(`[erc8004-debug] ${label} ${JSON.stringify(payload).slice(0, 50000)}`); }
 function parseJsonText(text) { if (typeof text !== 'string' || !text.trim()) return null; try { return JSON.parse(text); } catch { return null; } }
 function decodeDataUri(uri) { if (typeof uri !== 'string' || !uri.toLowerCase().startsWith('data:')) return null; try { const comma = uri.indexOf(','); if (comma < 0) return null; const metadata = uri.slice(5, comma); const payload = uri.slice(comma + 1); const isBase64 = /;base64(?:;|$)/i.test(metadata); const text = isBase64 ? Buffer.from(payload, 'base64').toString('utf8') : decodeURIComponent(payload); return parseJsonText(text); } catch (error) { debug('DATA_URI_DECODE_FAILED', { error: String(error) }); return null; } }
-async function fetchJson(url, init = {}) { debug('FETCH_START', { url, method: init.method || 'GET' }); let response; try { response = await fetch(url, { ...init, headers: { accept: 'application/json', ...(init.headers || {}) } }); } catch (error) { debug('FETCH_NETWORK_ERROR', { url, error: String(error) }); throw error; } const text = await response.text(); const body = parseJsonText(text); debug('FETCH_RESULT', { url, status: response.status, ok: response.ok, body: body ?? text }); if (!response.ok) throw new Error(`Registration request failed (${response.status}): ${text.slice(0, 500)}`); return body; }
+
+const registrationCache = new Map();
+const registrationCacheTtlMs = Number(process.env.AGENT8004SCAN_CACHE_TTL_MS || 300000);
+const scanRetryAttempts = Number(process.env.AGENT8004SCAN_RETRY_ATTEMPTS || 3);
+const scanRetryBaseMs = Number(process.env.AGENT8004SCAN_RETRY_BACKOFF_MS || 1000);
+
+function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+function isRetryableScanError(error) { return /Registration request failed \((?:429|500|502|503|504)\)/i.test(String(error?.message || error)) || /fetch failed|network|timeout|aborted/i.test(String(error?.message || error)); }
+
+async function fetchJson(url, init = {}, options = {}) {
+  debug('FETCH_START', { url, method: init.method || 'GET' });
+  let lastError;
+  const attempts = Math.max(1, Number(options.retries ?? scanRetryAttempts));
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    let response;
+    try {
+      response = await fetch(url, { ...init, headers: { accept: 'application/json', ...(init.headers || {}) } });
+    } catch (error) {
+      lastError = error;
+      debug('FETCH_NETWORK_ERROR', { url, attempt, error: String(error) });
+      if (attempt < attempts) { await sleep(Math.min(scanRetryBaseMs * 2 ** (attempt - 1), 10000)); continue; }
+      throw error;
+    }
+    const text = await response.text();
+    const body = parseJsonText(text);
+    debug('FETCH_RESULT', { url, status: response.status, ok: response.ok, body: body ?? text });
+    if (response.ok) return body;
+    lastError = new Error(`Registration request failed (${response.status}): ${text.slice(0, 500)}`);
+    if (!isRetryableScanError(lastError) || attempt >= attempts) throw lastError;
+    const retryAfter = Number(response.headers.get('retry-after'));
+    const delay = Number.isFinite(retryAfter) && retryAfter > 0 ? Math.min(retryAfter * 1000, 10000) : Math.min(scanRetryBaseMs * 2 ** (attempt - 1), 10000);
+    await sleep(delay);
+  }
+  throw lastError || new Error(`Registration request failed: ${url}`);
+}
 function registrationFromScan(body) { return body?.agent?.registrationFile || body?.registrationFile || body?.data?.registrationFile || null; }
 function agentUriFromScan(body) { return body?.agent?.agentURI || body?.agentURI || body?.data?.agentURI || null; }
 function rawMetadataFromScan(body) { return body?.raw_metadata || body?.rawMetadata || body?.agent?.raw_metadata || body?.agent?.rawMetadata || body?.data?.raw_metadata || body?.data?.rawMetadata || null; }
 function normalizeRawMetadata(rawMetadata) { if (!rawMetadata) return null; let parsed = rawMetadata; if (typeof parsed === 'string') parsed = parseJsonText(parsed) || decodeDataUri(parsed); if (!parsed || typeof parsed !== 'object') return null; const registration = parsed.offchain_content || parsed.offchainContent || parsed.registrationFile || parsed.registration || parsed; if (typeof registration === 'string') return parseJsonText(registration) || decodeDataUri(registration) || null; return registration && typeof registration === 'object' ? registration : null; }
 function normalizeEndpoint(value) { if (typeof value !== 'string' || !/^https?:\/\//i.test(value)) return null; try { return new URL(value).toString().replace(/\/$/, ''); } catch { return null; } }
 function serviceKind(service) { return String(service?.name ?? service?.type ?? service?.protocol ?? service?.kind ?? '').trim().toLowerCase(); }
-function servicesFromRegistration(registration) {
-  const raw = Array.isArray(registration?.services) ? registration.services : Array.isArray(registration?.endpoints) ? registration.endpoints : [];
-  const services = raw.map(service => {
-    if (typeof service === 'string') return { name: 'custom', endpoint: normalizeEndpoint(service) };
-    if (!service || typeof service !== 'object') return null;
-    const endpoint = normalizeEndpoint(service.endpoint) || normalizeEndpoint(service.url) || normalizeEndpoint(service.a2aEndpoint) || normalizeEndpoint(service.mcpEndpoint);
-    if (!endpoint) return null;
-    return { ...service, endpoint };
-  }).filter(Boolean);
-  const topLevelA2A = normalizeEndpoint(registration?.a2aEndpoint);
-  const topLevelMcp = normalizeEndpoint(registration?.mcpEndpoint);
-  if (topLevelA2A) services.push({ name: 'a2a', endpoint: topLevelA2A });
-  if (topLevelMcp) services.push({ name: 'mcp', endpoint: topLevelMcp });
-  return services;
-}
-async function resolveRegistration(agentId, chainId) { debug('RESOLVE_START', { agentId: String(agentId), chainId: Number(chainId) }); const headers = {}; if (process.env.AGENT8004SCAN_API_KEY) headers['X-API-Key'] = process.env.AGENT8004SCAN_API_KEY; const scanUrl = `${SCAN_BASE}/agents/${encodeURIComponent(chainId)}/${encodeURIComponent(agentId)}`; const body = await fetchJson(scanUrl, { headers }); let registration = registrationFromScan(body); const agentURI = agentUriFromScan(body); const rawMetadata = rawMetadataFromScan(body); if (!registration && rawMetadata) registration = normalizeRawMetadata(rawMetadata); if (!registration && agentURI) { registration = decodeDataUri(agentURI); if (!registration) { const uri = agentURI.startsWith('ipfs://') ? `https://ipfs.io/ipfs/${agentURI.slice(7)}` : agentURI; registration = await fetchJson(uri); } } if (!registration) throw new Error(`ERC-8004 agent ${agentId} has no resolvable registration file`); debug('REGISTRATION_SUCCESS', { agentId: String(agentId), chainId: Number(chainId), agentURI, registration }); return { registration, agentURI, scan: body }; }
+function servicesFromRegistration(registration) { const raw = Array.isArray(registration?.services) ? registration.services : Array.isArray(registration?.endpoints) ? registration.endpoints : []; const services = raw.map(service => { if (typeof service === 'string') return { name: 'custom', endpoint: normalizeEndpoint(service) }; if (!service || typeof service !== 'object') return null; const endpoint = normalizeEndpoint(service.endpoint) || normalizeEndpoint(service.url) || normalizeEndpoint(service.a2aEndpoint) || normalizeEndpoint(service.mcpEndpoint); if (!endpoint) return null; return { ...service, endpoint }; }).filter(Boolean); const topLevelA2A = normalizeEndpoint(registration?.a2aEndpoint); const topLevelMcp = normalizeEndpoint(registration?.mcpEndpoint); if (topLevelA2A) services.push({ name: 'a2a', endpoint: topLevelA2A }); if (topLevelMcp) services.push({ name: 'mcp', endpoint: topLevelMcp }); return services; }
+async function resolveRegistration(agentId, chainId) { const key = `${Number(chainId)}:${String(agentId)}`; const cached = registrationCache.get(key); if (cached && cached.expiresAt > Date.now()) { debug('REGISTRATION_CACHE_HIT', { agentId: String(agentId), chainId: Number(chainId) }); return cached.value; } debug('RESOLVE_START', { agentId: String(agentId), chainId: Number(chainId) }); const headers = {}; if (process.env.AGENT8004SCAN_API_KEY) headers['X-API-Key'] = process.env.AGENT8004SCAN_API_KEY; const scanUrl = `${SCAN_BASE}/agents/${encodeURIComponent(chainId)}/${encodeURIComponent(agentId)}`; try { const body = await fetchJson(scanUrl, { headers }); let registration = registrationFromScan(body); const agentURI = agentUriFromScan(body); const rawMetadata = rawMetadataFromScan(body); if (!registration && rawMetadata) registration = normalizeRawMetadata(rawMetadata); if (!registration && agentURI) { registration = decodeDataUri(agentURI); if (!registration) { const uri = agentURI.startsWith('ipfs://') ? `https://ipfs.io/ipfs/${agentURI.slice(7)}` : agentURI; registration = await fetchJson(uri, { retries: 2 }); } } if (!registration) throw new Error(`ERC-8004 agent ${agentId} has no resolvable registration file`); const value = { registration, agentURI, scan: body }; registrationCache.set(key, { value, expiresAt: Date.now() + registrationCacheTtlMs }); debug('REGISTRATION_SUCCESS', { agentId: String(agentId), chainId: Number(chainId), agentURI, registration }); return value; } catch (error) { const stale = registrationCache.get(key); if (stale) { debug('REGISTRATION_STALE_CACHE_FALLBACK', { agentId: String(agentId), chainId: Number(chainId), error: String(error) }); return stale.value; } throw error; } }
 function agentIdFromRecord(record) { const value = record?.agentId ?? record?.agent?.agentId ?? record?.tokenId ?? record?.agent?.tokenId; return value == null ? null : String(value); }
 function walletFromRecord(record) { return record?.agentWallet ?? record?.agent?.agentWallet ?? record?.wallet ?? record?.agent?.wallet ?? null; }
 function normalizeAddress(value) { return typeof value === 'string' && /^0x[a-fA-F0-9]{40}$/.test(value) ? value.toLowerCase() : null; }
@@ -36,49 +56,7 @@ function isERC8183Service(service) { return /erc.?8183/i.test(`${serviceKind(ser
 function normalizeA2AExecutionUrl(value, cardUrl) { const normalized = normalizeEndpoint(value); if (!normalized) return null; try { const candidate = new URL(normalized); const card = new URL(cardUrl); if (candidate.protocol === 'http:' && card.protocol === 'https:' && candidate.hostname === card.hostname) candidate.protocol = 'https:'; return candidate.toString().replace(/\/$/, ''); } catch { return normalized; } }
 function interfaceProtocolVersion(item, fallback = '0.3') { const value = item?.protocolVersion ?? item?.protocol_version ?? item?.version; return typeof value === 'string' && value ? value : fallback; }
 function interfaceBinding(item, fallback = 'JSONRPC') { return String(item?.protocolBinding ?? item?.protocol_binding ?? item?.transport ?? item?.preferredTransport ?? fallback).trim(); }
-async function resolveA2AExecutionEndpoint(service, agentId) {
-  if (!isA2AService(service)) return { endpoint: service.endpoint, protocolVersion: service.version || null, protocolBinding: interfaceBinding(service, 'HTTP+JSON') };
-  const card = await fetchJson(service.endpoint);
-  const interfaces = Array.isArray(card?.supportedInterfaces) ? card.supportedInterfaces : [];
-  const candidates = interfaces.map(item => ({ endpoint: normalizeA2AExecutionUrl(item?.url || item?.endpoint, service.endpoint), protocolVersion: interfaceProtocolVersion(item, card?.protocolVersion || service.version || '0.3'), protocolBinding: interfaceBinding(item, card?.preferredTransport || 'JSONRPC'), tenant: item?.tenant || null })).filter(item => item.endpoint);
-  if (!candidates.length) { const legacyEndpoint = normalizeA2AExecutionUrl(card?.url || card?.endpoint || card?.serviceEndpoint, service.endpoint); if (legacyEndpoint) candidates.push({ endpoint: legacyEndpoint, protocolVersion: card?.protocolVersion || service.version || '0.3', protocolBinding: card?.preferredTransport || 'JSONRPC', tenant: null }); }
-  const execution = candidates[0] || null;
-  debug('A2A_AGENT_CARD_RESOLUTION', { agentId: String(agentId), cardUrl: service.endpoint, execution, candidates, cardVersion: card?.protocolVersion || null });
-  if (!execution) throw new Error(`A2A agent ${agentId} returned an AgentCard without an executable endpoint`);
-  return { ...execution, card };
-}
-export async function resolveAgentService(agentId, chainId = 97) {
-  const { registration, agentURI, scan } = await resolveRegistration(agentId, chainId);
-  const services = servicesFromRegistration(registration);
-  debug('SERVICE_EXTRACTION', { agentId: String(agentId), services });
-
-  // ERC-8183 /status and /health endpoints are provider-management surfaces,
-  // not task-execution transports. An ERC-8183 provider's funded-job handler is
-  // invoked by its own on-chain poller, so AgentForge cannot execute a selected
-  // agent by POSTing an arbitrary task to that status URL. Only A2A, MCP, or an
-  // explicitly advertised non-ERC-8183 HTTP service may be used for execution.
-  const executableServices = services.filter(service => !isERC8183Service(service));
-  const preferred = executableServices.find(isA2AService) || executableServices.find(isMcpService) || executableServices.find(service => Boolean(normalizeEndpoint(service.endpoint)));
-  if (!preferred) {
-    throw new Error(`ERC-8004 agent ${agentId} has no executable service; ERC-8183 status/health endpoints are not task transports`);
-  }
-
-  const resolved = await resolveA2AExecutionEndpoint(preferred, agentId);
-  const protocol = isA2AService(preferred) ? 'a2a' : isMcpService(preferred) ? 'mcp' : 'custom';
-  return {
-    agentId: String(agentId), chainId: Number(chainId), agentURI, name: registration.name,
-    serviceName: preferred.name || protocol,
-    endpoint: resolved.endpoint,
-    registrationEndpoint: preferred.endpoint,
-    version: resolved.protocolVersion || preferred.version || null,
-    protocolVersion: resolved.protocolVersion || preferred.version || null,
-    protocolBinding: resolved.protocolBinding || null,
-    tenant: resolved.tenant || null,
-    protocol,
-    agentCard: resolved.card || null,
-    registration,
-    scan,
-  };
-}
+async function resolveA2AExecutionEndpoint(service, agentId) { if (!isA2AService(service)) return { endpoint: service.endpoint, protocolVersion: service.version || null, protocolBinding: interfaceBinding(service, 'HTTP+JSON') }; const card = await fetchJson(service.endpoint, {}, { retries: 2 }); const interfaces = Array.isArray(card?.supportedInterfaces) ? card.supportedInterfaces : []; const candidates = interfaces.map(item => ({ endpoint: normalizeA2AExecutionUrl(item?.url || item?.endpoint, service.endpoint), protocolVersion: interfaceProtocolVersion(item, card?.protocolVersion || service.version || '0.3'), protocolBinding: interfaceBinding(item, card?.preferredTransport || 'JSONRPC'), tenant: item?.tenant || null })).filter(item => item.endpoint); if (!candidates.length) { const legacyEndpoint = normalizeA2AExecutionUrl(card?.url || card?.endpoint || card?.serviceEndpoint, service.endpoint); if (legacyEndpoint) candidates.push({ endpoint: legacyEndpoint, protocolVersion: card?.protocolVersion || service.version || '0.3', protocolBinding: card?.preferredTransport || 'JSONRPC', tenant: null }); } const execution = candidates[0] || null; debug('A2A_AGENT_CARD_RESOLUTION', { agentId: String(agentId), cardUrl: service.endpoint, execution, candidates, cardVersion: card?.protocolVersion || null }); if (!execution) throw new Error(`A2A agent ${agentId} returned an AgentCard without an executable endpoint`); return { ...execution, card }; }
+export async function resolveAgentService(agentId, chainId = 97) { const { registration, agentURI, scan } = await resolveRegistration(agentId, chainId); const services = servicesFromRegistration(registration); debug('SERVICE_EXTRACTION', { agentId: String(agentId), services }); const executableServices = services.filter(service => !isERC8183Service(service)); const preferred = executableServices.find(isA2AService) || executableServices.find(isMcpService) || executableServices.find(service => Boolean(normalizeEndpoint(service.endpoint))); if (!preferred) throw new Error(`ERC-8004 agent ${agentId} has no executable service; ERC-8183 status/health endpoints are not task transports`); const resolved = await resolveA2AExecutionEndpoint(preferred, agentId); const protocol = isA2AService(preferred) ? 'a2a' : isMcpService(preferred) ? 'mcp' : 'custom'; return { agentId: String(agentId), chainId: Number(chainId), agentURI, name: registration.name, serviceName: preferred.name || protocol, endpoint: resolved.endpoint, registrationEndpoint: preferred.endpoint, version: resolved.protocolVersion || preferred.version || null, protocolVersion: resolved.protocolVersion || preferred.version || null, protocolBinding: resolved.protocolBinding || null, tenant: resolved.tenant || null, protocol, agentCard: resolved.card || null, registration, scan }; }
 export async function resolveAgentServiceForWallet(agentWallet, chainId = 97) { const agentId = await resolveAgentIdByWallet(agentWallet, chainId); return resolveAgentService(agentId, chainId); }
 export function extractAgentRoute(description) { const match = String(description || '').match(/ERC-8004 agent\s+(\d+)/i); return match ? { agentId: match[1], chainId: 97 } : null; }
