@@ -58,3 +58,15 @@ export async function getPersistedExecution(jobId) {
   if (error) throw new Error(`Execution lookup failed for job #${jobId}: ${error.message}`);
   return data;
 }
+
+export async function listPersistedSubmittedExecutions(limit = 100) {
+  assertConfigured();
+  const { data, error } = await supabase
+    .from("agentforge_executions")
+    .select("*")
+    .eq("status", "SUBMITTED")
+    .order("updated_at", { ascending: true })
+    .limit(Math.max(1, Math.min(Number(limit) || 100, 500)));
+  if (error) throw new Error(`Submitted execution lookup failed: ${error.message}`);
+  return data || [];
+}
