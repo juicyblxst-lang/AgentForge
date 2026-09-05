@@ -55,19 +55,21 @@ export default async function handler(req, res) {
       const body = req.body || {};
       const wallet = String(body.wallet || '').trim().toLowerCase();
       const status = String(body.status || '');
+      const jobId = String(body.jobId || '').trim();
       if (!/^0x[a-f0-9]{40}$/.test(wallet)) return send(res, 400, { error: 'Invalid wallet address' });
       if (!STATUSES.has(status)) return send(res, 400, { error: `Invalid execution status: ${status}` });
+      if (!jobId) return send(res, 400, { error: 'jobId is required' });
 
       const row = {
-        id: String(body.id || ''),
+        id: String(body.id || jobId),
         agent_id: String(body.agentId || ''),
         agent_name: String(body.agentName || ''),
         wallet,
         chain_id: 97,
         protocol: 'ERC-8183',
-        job_id: String(body.jobId || ''),
-        create_hash: String(body.createHash || ''),
-        fund_hash: String(body.fundHash || ''),
+        job_id: jobId,
+        create_hash: body.createHash ? String(body.createHash) : null,
+        fund_hash: body.fundHash ? String(body.fundHash) : null,
         status,
         submitted_at: body.submittedAt ? String(body.submittedAt) : null,
         settled_at: body.settledAt ? String(body.settledAt) : null,
@@ -76,15 +78,31 @@ export default async function handler(req, res) {
         updated_at: new Date().toISOString(),
       };
 
-      if (!row.id || !row.agent_id || !row.agent_name || !row.job_id || !row.create_hash || !row.fund_hash) {
-        return send(res, 400, { error: 'Invalid execution record' });
+      if (!row.agent_id || !row.agent_name) {
+        return send(res, 400, { error: 'agentId and agentName are required' });
       }
 
-      // Job ID is unique by migration and is the canonical correlation key.
-      // This makes repeated lifecycle writes idempotent even if the client uses
-      // a different local record id for the same on-chain job.
-      const { data, error } = await supabase
+      // Job ID is the canonical correlation key. Lifecycle writes may arrive
+      // from different components, so absent fields must not erase values that
+      // were already recorded for this job.
+      const { data: existing, error: existingError } = await supabase
         .from('agentforge_executions')
+        .select('*')
+        .eq('job_id', jobId)
+        .maybeSingle();
+      if (existingError) return send(res, 502, { error: existingError.message });
+
+      if (existing) {
+        row.id = existing.id;
+        row.create_hash = row.create_hash || existing.create_hash;
+        row.fund_hash = row.fund_hash || existing.fund_hash;
+        row.created_at = existing.created_at;
+        row.agent_id = existing.agent_id || row.agent_id;
+        row.agent_name = existing.agent_name || row.agent_name;
+        row.wallet = existing.wallet || row.wallet;
+      }
+
+      const { data, error } = await supabase
         .upsert(row, { onConflict: 'job_id' })
         .select()
         .single();
