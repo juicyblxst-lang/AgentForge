@@ -1,22 +1,22 @@
 import { createClient } from "@supabase/supabase-js";
+import { randomUUID } from "node:crypto";
 
 const supabaseUrl = process.env.SUPABASE_URL || "";
 const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
-const supabase = supabaseUrl && serviceRoleKey
-  ? createClient(supabaseUrl, serviceRoleKey, { auth: { persistSession: false, autoRefreshToken: false } })
-  : null;
-
+const supabase = supabaseUrl && serviceRoleKey ? createClient(supabaseUrl, serviceRoleKey, { auth: { persistSession: false, autoRefreshToken: false } }) : null;
 const STATUS_RANK = { CREATED: 0, REGISTERED: 1, FUNDED: 2, SUBMITTED: 3, SETTLED: 4, VERIFIED: 5, FAILED: 99 };
+const workerOwnerId = `${process.env.RENDER_INSTANCE_ID || process.env.RENDER_SERVICE_ID || "local"}:${process.pid}:${randomUUID()}`;
 
-function assertConfigured() {
-  if (!supabase) throw new Error("Supabase persistence is not configured for the provider worker");
-}
-function address(value) {
-  const normalized = String(value || "").trim().toLowerCase();
-  if (!/^0x[a-f0-9]{40}$/.test(normalized)) throw new Error(`Invalid wallet address: ${value}`);
-  return normalized;
-}
+function assertConfigured() { if (!supabase) throw new Error("Supabase persistence is not configured for the provider worker"); }
+function address(value) { const normalized = String(value || "").trim().toLowerCase(); if (!/^0x[a-f0-9]{40}$/.test(normalized)) throw new Error(`Invalid wallet address: ${value}`); return normalized; }
 function statusRank(status) { return STATUS_RANK[String(status || "").toUpperCase()] ?? -1; }
+
+export async function acquireWorkerLease(ttlSeconds = 120) {
+  assertConfigured();
+  const { data, error } = await supabase.rpc("claim_agentforge_worker_lease", { p_lease_key: "provider-poller", p_owner_id: workerOwnerId, p_ttl_seconds: ttlSeconds });
+  if (error) throw new Error(`Provider worker lease failed: ${error.message}`);
+  return data === true;
+}
 
 export async function persistExecution({ job, agentId, agentName, status, deliverable = null, submittedAt = null, settledAt = null, createHash = null, fundHash = null }) {
   assertConfigured();
@@ -25,12 +25,10 @@ export async function persistExecution({ job, agentId, agentName, status, delive
   const normalizedStatus = String(status || "").toUpperCase();
   if (!Object.hasOwn(STATUS_RANK, normalizedStatus)) throw new Error(`Invalid execution status: ${status}`);
   if (!agentId || !agentName) throw new Error("ERC-8004 agent identity is required for execution persistence");
-
   const { data: existing, error: existingError } = await supabase.from("agentforge_executions").select("*").eq("job_id", jobId).maybeSingle();
   if (existingError) throw new Error(`Execution lookup failed for job #${jobId}: ${existingError.message}`);
   const existingRank = existing ? statusRank(existing.status) : -1;
   if (existing && existingRank > statusRank(normalizedStatus)) return existing;
-
   const now = new Date().toISOString();
   const row = {
     id: existing?.id || jobId,
