@@ -2,7 +2,7 @@ import { createServer } from "node:http";
 import { EVMWalletProvider, ERC8183Client, loadEnv } from "@bnbagent/sdk";
 import { ERC8183JobOps } from "@bnbagent/sdk/erc8183";
 import { LocalStorageProvider } from "@bnbagent/sdk/storage";
-import { resolveAgentService } from "./erc8004-agent.mjs";
+import { resolveAgentService, extractAgentRoute } from "./erc8004-agent.mjs";
 
 loadEnv();
 
@@ -188,14 +188,14 @@ async function executeSelectedAgent(job, service) {
   }
 }
 
-async function executeDynamicAgent(job, requestedAgentId = null) {
-  const match = String(job.description || "").match(/ERC-8004 agent\s+(\d+)/i);
-  const agentId = requestedAgentId ?? match?.[1];
-  if (!agentId) throw new Error(`No ERC-8004 agent route found in job #${job.id}`);
-  const service = await resolveAgentService(agentId, 97);
+async function executeDynamicAgent(job) {
+  const route = extractAgentRoute(job.description);
+  if (!route?.agentId) throw new Error(`No ERC-8004 agent route found in job #${job.id}`);
+  const agentId = route.agentId;
+  const service = await resolveAgentService(agentId, route.chainId);
   console.log(`[provider] resolved ERC-8004 #${agentId} ${service.serviceName} ${service.endpoint} (${service.protocolVersion || "unknown"})`);
   const agentResult = await executeSelectedAgent(job, service);
-  return { route: { agentId: String(agentId), chainId: 97, source: "erc8004-registration" }, service, agentResult };
+  return { route: { agentId: String(agentId), chainId: Number(route.chainId), source: "erc8004-job-description" }, service, agentResult };
 }
 
 async function submitExecution(job, execution) {
@@ -215,7 +215,7 @@ async function submitExecution(job, execution) {
   return result;
 }
 
-async function processFundedJob(job, requestedAgentId = null) {
+async function processFundedJob(job) {
   const key = job.id.toString();
   if (executing.has(key)) return { accepted: false, reason: "already executing" };
   if (terminalFailures.has(key)) return { accepted: false, reason: "terminal failure" };
@@ -224,7 +224,7 @@ async function processFundedJob(job, requestedAgentId = null) {
   executing.add(key);
   try {
     console.log(`[provider] executing funded job #${key}: ${job.description}`);
-    const execution = await executeDynamicAgent(job, requestedAgentId);
+    const execution = await executeDynamicAgent(job);
     console.log(`[provider] agent #${key} returned: ${execution.agentResult.text.slice(0, 1000)}`);
     const result = await submitExecution(job, execution);
     console.log(`[provider] submitted #${key}: ${result.txHash}`);
@@ -260,8 +260,15 @@ const httpServer = createServer(async (req, res) => {
       const job = await client.getJob(BigInt(jobId));
       if (job.provider.toLowerCase() !== jobOps.agentAddress.toLowerCase()) { sendJson(res, 403, { error: "Job provider does not match AgentForge provider" }); return; }
       if (job.status !== 1) { sendJson(res, 409, { error: `Job #${jobId} is not Funded`, status: Number(job.status) }); return; }
-      const processed = await processFundedJob(job, body.agentId ?? null);
-      if (!processed.accepted) { sendJson(res, 409, { error: `Job #${jobId} is already being executed`, reason: processed.reason }); return; }
+      const processed = await processFundedJob(job);
+      if (!processed.accepted) {
+        if (processed.reason === "already executing") {
+          sendJson(res, 202, { status: "processing", jobId, reason: processed.reason });
+        } else {
+          sendJson(res, 409, { error: `Job #${jobId} cannot be processed`, reason: processed.reason });
+        }
+        return;
+      }
       sendJson(res, 200, { status: "submitted", jobId, txHash: processed.result.txHash, route: processed.execution.route, service: processed.execution.service, result: processed.execution.agentResult });
       return;
     }
